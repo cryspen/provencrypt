@@ -1,0 +1,59 @@
+[workspace]
+# A specification and implementations of it, side by side: `sha3/spec` is the
+# FIPS 202 transcript, and `sha3/libcrux-iot-5df472a/annotated-upstream` the SHA-3 crate of
+# upstream libcrux-iot, patched so that its `#[ensures]` clauses name the
+# transcript. They are pinned to each other by PATH rather than by commit SHA --
+# that is the point of keeping them in one repository -- so a change to the
+# transcript and the proof update it forces land together. `sha3/spec/mlkem-c-ref`
+# holds tests of the transcript against the SHA-3 code of the ML-KEM C reference
+# implementation; it is a crate of its own so that only it needs a C compiler.
+# `sha3/libcrux-iot-5df472a/tests` runs the implementation against the transcript;
+# it is a crate of its own so that `annotated-upstream/`
+# stays upstream's crate plus the annotation patches.
+members = [
+    "sha3/spec",
+    "sha3/spec/mlkem-c-ref",
+    "sha3/libcrux-iot-5df472a/annotated-upstream",
+    "sha3/libcrux-iot-5df472a/tests",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.3"
+authors = ["Cryspen"]
+license = "AGPL-3.0-only"
+homepage = "iot.cryspen.com"
+edition = "2021"
+repository = "https://github.com/cryspen/provencrypt"
+readme = "README.md"
+
+[workspace.dependencies]
+# The transcript, by path: the implementations' contracts name
+# `pedantic_sha3::bytes::…` directly, so it is a normal dependency and
+# has to be in scope for the hax build as well as for `cargo test`.
+pedantic-sha3 = { path = "sha3/spec" }
+
+# From the libcrux repository, all at one commit.
+libcrux-kats = { git = "https://github.com/celabshq/libcrux.git", rev = "3e2f73a0a267f838268edd68c23b80d72c1c9d7d" }
+libcrux-secrets = { git = "https://github.com/celabshq/libcrux.git", rev = "3e2f73a0a267f838268edd68c23b80d72c1c9d7d" }
+libcrux-traits = { git = "https://github.com/celabshq/libcrux.git", rev = "3e2f73a0a267f838268edd68c23b80d72c1c9d7d" }
+# Exactly 0.4.2: the `cargo-hax` binary below refuses any other version, and a
+# floating requirement would drift off it the next time a 0.4.x is published.
+hax-lib = { version = "=0.4.2" }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(hax)',
+    'cfg(eurydice)',
+    'cfg(doc_cfg)',
+    'cfg(hax_backend_lean)',
+] }
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[workspace.metadata.bin]
+# The version of hax to use, matching the `hax-lib` the packages depend on.
+cargo-hax = { version = "0.4.2", bins = ["cargo-hax"], locked = true }

@@ -1,0 +1,28 @@
+name = "LibcruxIotSha3"
+version = "0.1.0"
+defaultTargets = ["LibcruxIotSha3"]
+
+[[lean_lib]]
+name = "LibcruxIotSha3"
+# `globs` names only the root module: the library is driven by the
+# `LibcruxIotSha3` root module's import tree (below) rather than by globbing
+# every file on disk. This keeps the generated `Extraction/ProofObligations.lean`
+# (sorry-filled, @[spec]-tagged, and imported by nothing) OUT of the build while
+# leaving the file on disk. The root imports the import-DAG sink
+# `Verification.ProofObligations`, which transitively pulls in every real proof
+# module.
+globs = ["LibcruxIotSha3"]
+
+[[require]]
+name = "hax"
+git = "https://github.com/cryspen/hax-lean"
+rev = "v0.3.30"
+
+# `pedantic-sha3` (`sha3/spec` in this repository): the FIPS 202
+# transcript (state array of bits, Algorithms 1-11).  This is what the crate's
+# `#[ensures]` clauses name and what the trust argument rests on.  By PATH, to
+# the same directory `Cargo.toml` points the crate dependency at -- one
+# revision of the transcript for the Rust build and for the proof, always.
+[[require]]
+name = "PedanticSha3"
+path = "../../spec/proofs/pedantic-sha3/lean"

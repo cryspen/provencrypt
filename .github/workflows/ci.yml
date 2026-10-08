@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Formatting of our own crates, and every Rust test in the workspace.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # `annotated-upstream/` is upstream's crate and keeps upstream's formatting.
+      - run: cargo fmt --check -p pedantic-sha3 -p sha3-mlkem-c-ref-tests -p libcrux-iot-sha3-spec-tests
+      # `cavp_bits.rs` downloads NIST's bit-oriented vectors and skips when it
+      # cannot; here a failed download fails the job instead.
+      - run: cargo test --release --workspace
+        env:
+          PEDANTIC_SHA3_REQUIRE_VECTORS: 1
+
+  # `annotated-upstream/` is exactly upstream libcrux-iot at the pinned commit
+  # with `annotation-patches/` applied.
+  annotated-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C sha3/libcrux-iot-5df472a check
+
+  # The committed Lean extraction is what hax generates from the committed Rust.
+  extraction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall --no-confirm cargo-run-bin@1.7.5
+      # `.bin/` holds the hax binary that `cargo bin` installs, `~/.cache/hax`
+      # the charon and aeneas releases hax downloads.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .bin
+            ~/.cache/hax
+          key: hax-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'hax.toml') }}
+      - run: cargo hax extract pedantic-sha3
+      - run: cargo hax extract libcrux-iot-sha3
+      - name: Check that the extraction is up to date
+        run: |
+          git diff --exit-code
+          test -z "$(git status --porcelain)" || { git status --short; exit 1; }
+
+  # Both Lean projects build, with every `#guard_msgs` axiom guard passing and
+  # no `sorry`. Building the implementation's proofs builds the specification's
+  # package too, as a path dependency.
+  lean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: sha3/libcrux-iot-5df472a/proofs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        working-directory: .
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+      - name: Install elan
+        working-directory: .
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      # Everything but mathlib, which `lake exe cache get` downloads prebuilt:
+      # caching it as well would exceed the repository's cache quota.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            sha3/libcrux-iot-5df472a/proofs/.lake
+            !sha3/libcrux-iot-5df472a/proofs/.lake/packages/mathlib
+            sha3/spec/proofs/pedantic-sha3/lean/.lake/build
+          key: lean-${{ hashFiles('sha3/libcrux-iot-5df472a/proofs/lake-manifest.json', 'sha3/libcrux-iot-5df472a/proofs/lean-toolchain') }}-${{ github.sha }}
+          restore-keys: |
+            lean-${{ hashFiles('sha3/libcrux-iot-5df472a/proofs/lake-manifest.json', 'sha3/libcrux-iot-5df472a/proofs/lean-toolchain') }}-
+      - run: lake exe cache get
+      - run: lake build 2>&1 | tee build.log
+        shell: bash -o pipefail {0}
+      - name: Check for sorry
+        run: |
+          if grep -E "declaration uses .sorry." build.log; then
+            echo "A proof uses sorry."
+            exit 1
+          fi

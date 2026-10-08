@@ -1,0 +1,11 @@
+# `cargo hax extract <scenario>`, run from this directory.
+
+[scenario.pedantic-sha3]
+package = "pedantic-sha3"
+backend = "lean"
+
+[scenario.libcrux-iot-sha3]
+package = "libcrux-iot-sha3"
+backend = "lean"
+# The crate is upstream's, in `annotated-upstream/`; its Lean package lives next to it.
+output-dir = "../proofs"

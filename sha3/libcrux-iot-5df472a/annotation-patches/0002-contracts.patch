@@ -1,0 +1,175 @@
+State functional correctness in the contracts.
+
+Adds an `#[ensures]` to each of the thirteen public SHA-3 and SHAKE functions,
+comparing its output to the FIPS 202 transcript `pedantic-sha3`, the
+`digest_matches` helper `hash`'s contract uses, and the dependency on the
+transcript. Upstream's own `#[requires]` clauses are left as they are.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 8d79c53..6c1c4aa 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -19,6 +19,8 @@ bench = false # so libtest doesn't eat the arguments to criterion
+ libcrux-secrets.workspace = true
+ libcrux-traits.workspace = true
+ hax-lib.workspace = true
++# The specification the `#[ensures]` clauses name.
++pedantic-sha3.workspace = true
+ 
+ # XXX: Unfortunately, it's not possible to use certain hax attributes
+ # with `cfg_attr`, which means we can't have hax-lib as a `cfg(hax)`
+diff --git a/src/lib.rs b/src/lib.rs
+index 4c58974..ae76bde 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -51,6 +51,13 @@
+ #![deny(missing_docs)]
+ 
+ use libcrux_secrets::{Classify, U8};
++// Only the `#[ensures]` clauses use these, and hax-lib's attribute macros are
++// identity macros when `hax` is off, so gate them to avoid an unused-import
++// warning in normal builds.
++#[cfg(hax)]
++use libcrux_secrets::Declassify as _;
++#[cfg(hax)]
++use libcrux_secrets::DeclassifyRef as _;
+ 
+ mod keccak;
+ mod lane;
+@@ -127,6 +134,22 @@ pub const fn digest_size(mode: Algorithm) -> usize {
+     }
+ }
+ 
++/// Whether `out` is the digest FIPS 202 prescribes for `algorithm` and `payload`.
++///
++/// Specification-only, and a `bool`-valued comparison rather than a constructor:
++/// each arm is a slice `==` against the transcript, which is a shape hax models,
++/// whereas returning a `Vec` per arm would lean on `to_vec`. `hash`'s
++/// `#[ensures]` is the only caller.
++#[cfg(hax)]
++fn digest_matches(algorithm: Algorithm, payload: &[u8], out: &[u8]) -> bool {
++    match algorithm {
++        Algorithm::Sha224 => out == &pedantic_sha3::bytes::sha3_224(payload)[..],
++        Algorithm::Sha256 => out == &pedantic_sha3::bytes::sha3_256(payload)[..],
++        Algorithm::Sha384 => out == &pedantic_sha3::bytes::sha3_384(payload)[..],
++        Algorithm::Sha512 => out == &pedantic_sha3::bytes::sha3_512(payload)[..],
++    }
++}
++
+ /// Hashes using a particular [`Algorithm`] of the SHA3 family.
+ ///
+ /// # Examples
+@@ -138,6 +161,7 @@ pub const fn digest_size(mode: Algorithm) -> usize {
+ /// let digest: [u8; digest_size(Algorithm::Sha256)] = hash(Algorithm::Sha256, payload);
+ /// ```
+ #[hax_lib::requires(LEN == digest_size(algorithm))]
++#[hax_lib::ensures(|out| digest_matches(algorithm, payload.declassify_ref(), &out.declassify()[..]))]
+ pub fn hash<const LEN: usize>(algorithm: Algorithm, payload: &[U8]) -> [U8; LEN] {
+     #[cfg(not(eurydice))]
+     debug_assert!(payload.len() <= u32::MAX as usize);
+@@ -169,6 +193,8 @@ pub fn hash<const LEN: usize>(algorithm: Algorithm, payload: &[U8]) -> [U8; LEN]
+ pub use hash as sha3;
+ 
+ /// Returns SHA3-224 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::sha3_224(payload.declassify_ref())[..])]
+ pub fn sha224(payload: &[U8]) -> [U8; SHA3_224_DIGEST_SIZE] {
+     let mut out = [0u8; SHA3_224_DIGEST_SIZE].classify();
+ 
+@@ -187,6 +213,8 @@ pub fn sha224(payload: &[U8]) -> [U8; SHA3_224_DIGEST_SIZE] {
+ /// Preconditions:
+ /// - `digest` is exactly [`SHA3_224_DIGEST_SIZE`] bytes long
+ #[hax_lib::requires(digest.len() == SHA3_224_DIGEST_SIZE)]
++#[hax_lib::ensures(|_| future(digest).declassify_ref()
++        == &pedantic_sha3::bytes::sha3_224(payload.declassify_ref())[..])]
+ pub fn sha224_ema(digest: &mut [U8], payload: &[U8]) {
+     #[cfg(not(eurydice))]
+     debug_assert!(payload.len() <= u32::MAX as usize);
+@@ -197,6 +225,8 @@ pub fn sha224_ema(digest: &mut [U8], payload: &[U8]) {
+ }
+ 
+ /// Returns SHA3-256 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::sha3_256(payload.declassify_ref())[..])]
+ pub fn sha256(payload: &[U8]) -> [U8; SHA3_256_DIGEST_SIZE] {
+     let mut out = [0u8; SHA3_256_DIGEST_SIZE].classify();
+ 
+@@ -215,6 +245,8 @@ pub fn sha256(payload: &[U8]) -> [U8; SHA3_256_DIGEST_SIZE] {
+ /// Preconditions:
+ /// - `digest` is exactly [`SHA3_256_DIGEST_SIZE`] bytes long
+ #[hax_lib::requires(digest.len() == SHA3_256_DIGEST_SIZE)]
++#[hax_lib::ensures(|_| future(digest).declassify_ref()
++        == &pedantic_sha3::bytes::sha3_256(payload.declassify_ref())[..])]
+ pub fn sha256_ema(digest: &mut [U8], payload: &[U8]) {
+     #[cfg(not(eurydice))]
+     debug_assert!(payload.len() <= u32::MAX as usize);
+@@ -225,6 +257,8 @@ pub fn sha256_ema(digest: &mut [U8], payload: &[U8]) {
+ }
+ 
+ /// Returns SHA3-384 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::sha3_384(payload.declassify_ref())[..])]
+ pub fn sha384(payload: &[U8]) -> [U8; SHA3_384_DIGEST_SIZE] {
+     let mut out = [0u8; SHA3_384_DIGEST_SIZE].classify();
+ 
+@@ -243,6 +277,8 @@ pub fn sha384(payload: &[U8]) -> [U8; SHA3_384_DIGEST_SIZE] {
+ /// Preconditions:
+ /// - `digest` is exactly [`SHA3_384_DIGEST_SIZE`] bytes long
+ #[hax_lib::requires(digest.len() == SHA3_384_DIGEST_SIZE)]
++#[hax_lib::ensures(|_| future(digest).declassify_ref()
++        == &pedantic_sha3::bytes::sha3_384(payload.declassify_ref())[..])]
+ pub fn sha384_ema(digest: &mut [U8], payload: &[U8]) {
+     #[cfg(not(eurydice))]
+     debug_assert!(payload.len() <= u32::MAX as usize);
+@@ -253,6 +289,8 @@ pub fn sha384_ema(digest: &mut [U8], payload: &[U8]) {
+ }
+ 
+ /// Returns SHA3-512 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::sha3_512(payload.declassify_ref())[..])]
+ pub fn sha512(payload: &[U8]) -> [U8; SHA3_512_DIGEST_SIZE] {
+     let mut out = [0u8; SHA3_512_DIGEST_SIZE].classify();
+ 
+@@ -271,6 +309,8 @@ pub fn sha512(payload: &[U8]) -> [U8; SHA3_512_DIGEST_SIZE] {
+ /// Preconditions:
+ /// - `digest` is exactly [`SHA3_512_DIGEST_SIZE`] bytes long
+ #[hax_lib::requires(digest.len() == SHA3_512_DIGEST_SIZE)]
++#[hax_lib::ensures(|_| future(digest).declassify_ref()
++        == &pedantic_sha3::bytes::sha3_512(payload.declassify_ref())[..])]
+ pub fn sha512_ema(digest: &mut [U8], payload: &[U8]) {
+     #[cfg(not(eurydice))]
+     debug_assert!(payload.len() <= u32::MAX as usize);
+@@ -281,6 +321,8 @@ pub fn sha512_ema(digest: &mut [U8], payload: &[U8]) {
+ }
+ 
+ /// Returns SHAKE-128 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::shake128(data.declassify_ref(), BYTES)[..])]
+ pub fn shake128<const BYTES: usize>(data: &[U8]) -> [U8; BYTES] {
+     let mut out = [0u8; BYTES].classify();
+ 
+@@ -297,11 +339,15 @@ pub fn shake128<const BYTES: usize>(data: &[U8]) -> [U8; BYTES] {
+ /// Writes SHAKE-128 digest of input payload to externally allocated buffer.
+ ///
+ /// Writes `out.len()` bytes
++#[hax_lib::ensures(|_| future(out).declassify_ref()
++        == &pedantic_sha3::bytes::shake128(data.declassify_ref(), out.len())[..])]
+ pub fn shake128_ema(out: &mut [U8], data: &[U8]) {
+     keccakx1::<168, 0x1fu8>(data, out);
+ }
+ 
+ /// Returns SHAKE256 digest of input payload.
++#[hax_lib::ensures(|out| out.declassify()[..]
++    == pedantic_sha3::bytes::shake256(data.declassify_ref(), BYTES)[..])]
+ pub fn shake256<const BYTES: usize>(data: &[U8]) -> [U8; BYTES] {
+     let mut out = [0u8; BYTES].classify();
+ 
+@@ -318,6 +364,8 @@ pub fn shake256<const BYTES: usize>(data: &[U8]) -> [U8; BYTES] {
+ /// Writes SHAKE256 digest of input payload to externally allocated buffer.
+ ///
+ /// Writes `out.len()` bytes.
++#[hax_lib::ensures(|_| future(out).declassify_ref()
++        == &pedantic_sha3::bytes::shake256(data.declassify_ref(), out.len())[..])]
+ pub fn shake256_ema(out: &mut [U8], data: &[U8]) {
+     keccakx1::<136, 0x1fu8>(data, out);
+ }

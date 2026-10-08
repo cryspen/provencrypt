@@ -1,0 +1,11 @@
+name = "PedanticSha3"
+version = "0.1.0"
+defaultTargets = ["PedanticSha3"]
+
+[[lean_lib]]
+name = "PedanticSha3"
+
+[[require]]
+name = "hax"
+git = "https://github.com/cryspen/hax-lean"
+rev = "v0.3.30"

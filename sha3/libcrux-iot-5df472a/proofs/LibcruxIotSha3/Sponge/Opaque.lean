@@ -1,0 +1,116 @@
+/-
+  # Opaque seal for `keccakf1600`
+
+  Sealed `@[spec]` Triple bridging the impl `keccak.keccakf1600` to the
+  lane model's `keccakFLanes` for use throughout the sponge proofs.
+
+  The post strengthens the permutation equivalence
+  `Permutation.keccakf1600_equiv_lanes`
+  with `r.i.val = 0` — needed because the impl's `keccakf1600` resets
+  `s.i := 0#usize` at the end, and every subsequent absorb/squeeze step's
+  precondition requires `s.i.val = 0`.
+
+  After the seal proves, `keccak.keccakf1600` and `keccakFLanes` are
+  marked `attribute [local irreducible]` so downstream files cannot peek
+  inside.
+-/
+import LibcruxIotSha3.Permutation.Keccakf1600
+import LibcruxIotSha3.Model.SpongeModel
+
+open Aeneas Aeneas.Std RustM Std.Do libcrux_iot_sha3
+open LibcruxIotSha3.LaneModel
+
+namespace libcrux_iot_sha3.Sponge
+
+open libcrux_iot_sha3.Support (triple_exists_ok)
+open Hax (triple_of_ok)
+
+open libcrux_iot_sha3.Permutation
+
+/-! ## Opaque seal for `keccakf1600`. -/
+
+/-- Local shape: `Triple` postshape for `RustM α`. -/
+private abbrev ResultPSU :=
+  PostShape.except Aeneas.Std.Error (PostShape.except PUnit PostShape.pure)
+
+/-- If a `Triple ⦃ True ⦄ x ⦃ noThrow Q ⦄` holds then `x` reduces to some
+    `ok v`. -/
+private theorem triple_noThrow_exists_ok_local {α : Type} {x : RustM α}
+    {Q : α → Assertion ResultPSU}
+    (h : ⦃ ⌜ True ⌝ ⦄ x ⦃ PostCond.noThrow Q ⦄) : ∃ v, x = .ok v := by
+  match x, h with
+  | .ok v, _ => exact ⟨v, rfl⟩
+  | .fail _, h => exact absurd h (by simp [Triple, WP.wp, PredTrans.apply])
+  | .div, h => exact absurd h (by simp [Triple, WP.wp, PredTrans.apply])
+
+/-- If `x = .ok v` and `Triple ⦃ True ⦄ x ⦃ noThrow Q ⦄`, then `Q v`
+    holds. -/
+private theorem triple_noThrow_elim_local {α : Type} {x : RustM α}
+    {Q : α → Assertion ResultPSU}
+    (h : ⦃ ⌜ True ⌝ ⦄ x ⦃ PostCond.noThrow Q ⦄) {v : α} (hv : x = .ok v) :
+    (Q v).down := by
+  subst hv; simpa [Triple, WP.wp, PredTrans.apply] using h
+
+/-- Any successful `keccak.keccakf1600` execution sets `i := 0#usize` in
+    its output state. This is by construction: the impl body ends with
+    `ok { s1 with i := 0#usize }`.
+
+    This is the *only* place we ever `unfold keccak.keccakf1600`; the
+    attribute at the bottom of this file seals it for the rest of
+    the sponge proofs. -/
+private theorem keccakf1600_i_zero_of_ok
+    {s r : state.KeccakState} (h : keccak.keccakf1600 s = .ok r) :
+    r.i = 0#usize := by
+  unfold keccak.keccakf1600 at h
+  -- Body: `do let s1 ← keccakf1600_loop ... ; ok { s1 with i := 0#usize }`.
+  cases hl : keccak.keccakf1600_loop { start := 0#i32, «end» := 6#i32 } s with
+  | ok s1 =>
+      rw [hl] at h
+      -- After rewrite: `ok { s1 with i := 0#usize } = .ok r`.
+      injection h with h
+      rw [← h]
+  | fail e =>
+      rw [hl] at h; cases h
+  | div =>
+      rw [hl] at h; cases h
+
+/-- Sealed `@[spec]` Triple bridging the impl-level `keccak.keccakf1600`
+    to the lane model's `keccakFLanes`.
+
+    Carries two facts:
+    - spec-equality:    `keccakFLanes (lift s) = lift r`
+    - i-reset:          `r.i.val = 0`
+
+    The second clause is required for chaining: every subsequent absorb
+    or squeeze step's precondition is `s.i.val = 0`. -/
+@[spec]
+theorem keccakf1600_seal_spec (s : state.KeccakState) (h_i : s.i.val = 0) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.keccakf1600 s
+    ⦃ ⇓ r => ⌜ keccakFLanes (Permutation.lift s) = Permutation.lift r
+              ∧ r.i.val = 0 ⌝ ⦄ := by
+  -- Convert the `.val` form of `h_i` to the bit-vector form `keccakf1600_equiv_lanes`
+  -- expects.
+  have h_i' : s.i = 0#usize := Std.UScalar.eq_of_val_eq (by simpa using h_i)
+  -- `keccakf1600_equiv_lanes` gives the spec-equality half of the post.
+  have h_bridge :=
+    Permutation.keccakf1600_equiv_lanes s h_i'
+  -- Extract the underlying RustM equation `keccak.keccakf1600 s = .ok r0`.
+  obtain ⟨r0, h_ok⟩ := triple_noThrow_exists_ok_local h_bridge
+  -- `keccakf1600_equiv_lanes`'s post evaluated at `r0`: spec-equality half.
+  have h_spec : keccakFLanes (Permutation.lift s) = Permutation.lift r0 :=
+    triple_noThrow_elim_local h_bridge h_ok
+  -- Body-derived fact: `r0.i = 0#usize` ⇒ `r0.i.val = 0`.
+  have h_r0_i : r0.i = 0#usize := keccakf1600_i_zero_of_ok h_ok
+  have h_r0_val : r0.i.val = 0 := by
+    rw [h_r0_i]; rfl
+  -- Repackage as a Triple with the conjoined post.
+  exact triple_of_ok h_ok ⟨h_spec, h_r0_val⟩
+
+/-! Seal: from here on, no proof in `Sponge/` may unfold either side of
+    the permutation equivalence `keccakf1600_equiv_lanes`. Importing files inherit `local irreducible` for these
+    declarations, and each downstream file in `Sponge/` re-issues the
+    attribute defensively. -/
+attribute [local irreducible] keccak.keccakf1600 keccakFLanes
+
+end libcrux_iot_sha3.Sponge

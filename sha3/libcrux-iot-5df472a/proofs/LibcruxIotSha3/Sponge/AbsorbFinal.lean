@@ -1,0 +1,419 @@
+/-
+  # `keccak.absorb_final` ↔ `absorbFinalLanes`
+
+  Main Triple `keccak.absorb_final_spec` with the full equality-form post:
+
+  * termination of `keccak.absorb_final`;
+  * `r.i.val = 0` on the result (consumed by the top-level `keccak` proof's
+    squeeze-first-block precondition);
+  * the spec equation
+    `absorbFinalLanes (lift s) last start len RATE DELIM = lift r`.
+
+  Both impl and spec follow the same 4-step buffer recipe (zero-init,
+  copy `last[start..start+len]` into buf[0..len], `buf[len] := DELIM`,
+  OR `0x80` into `buf[RATE-1]`), then load and permute. The impl uses
+  `if len > 0` to skip the `copy_from_slice` of an empty slice; the
+  spec always takes the index_mut path, which is identity when
+  `len = 0` (empty slice + `setSlice! 0 []` = no-op). Both yield the
+  *same* `buf3`.
+
+  Impl and spec sides are walked as independent `.ok`-equation chains and
+  composed at the end:
+
+  1. `h_impl_eq : keccak.absorb_final ... = .ok r`
+  2. `h_buf3_pad : buf3.val = padBlockList ...` — the impl's buffer chain
+     is the model's padded block.
+  3. Compose via `h_r_spec` from `keccak.absorb_block_spec`.
+-/
+import LibcruxIotSha3.Sponge.AbsorbBlock
+
+open Aeneas Aeneas.Std RustM Std.Do libcrux_iot_sha3
+open LibcruxIotSha3.LaneModel
+open LibcruxIotSha3.SpongeModel
+
+namespace libcrux_iot_sha3.Sponge
+
+open libcrux_iot_sha3.Support (triple_exists_ok)
+open Hax (triple_of_ok)
+
+open libcrux_iot_sha3.Permutation
+
+-- Defensive seal re-issue: no proof in this file may unfold either side
+-- of the permutation equivalence `keccakf1600_equiv_lanes`.
+attribute [local irreducible] keccak.keccakf1600 keccakFLanes
+
+/-! ## `keccak.absorb_final` ↔ `absorbFinalLanes`. -/
+
+/-! ### Array index_mut Triple over `Range Usize`.
+
+The Array variant of `core_models_Slice_Insts_index_mut_RangeUsize_spec`
+(SliceSpecs.lean). Routes through `Array.to_slice_mut`. -/
+@[spec]
+theorem core_models_Array_Insts_index_mut_RangeUsize_spec
+    {T : Type} {N : Std.Usize} (arr : Std.Array T N)
+    (r : CoreModels.core.ops.range.Range Std.Usize)
+    (h0 : r.start.val ≤ r.end.val) (h1 : r.end.val ≤ N.val) :
+    ⦃ ⌜ True ⌝ ⦄
+    CoreModels.core.Array.Insts.CoreOpsIndexIndexMut.index_mut
+      (CoreModels.core.Slice.Insts.CoreOpsIndexIndexMut
+        (CoreModels.core.ops.range.RangeUsize.Insts.CoreSliceIndexSliceIndexSliceSlice T)) arr r
+    ⦃ ⇓ p => ⌜ p.1.val = arr.val.slice r.start.val r.end.val ∧
+                p.1.val.length = r.end.val - r.start.val ∧
+                ∀ s' : Slice T, s'.val.length = r.end.val - r.start.val →
+                  (p.2 s').val = arr.val.setSlice! r.start.val s'.val ⌝ ⦄ := by
+  -- CoreModels supplies this instance natively: the body is
+  --   let (s, back_a) ← array.Array.as_mut_slice arr   -- ok (to_slice_mut arr)
+  --   let (t, back_s) ← inst.index_mut s r             -- slice_slice_mut
+  --   ok (t, back_a ∘ back_s)
+  -- so the read is `subslice` on `to_slice arr` and the write-back is
+  -- `from_slice arr ∘ setSlice!`.
+  unfold CoreModels.core.Array.Insts.CoreOpsIndexIndexMut.index_mut
+  have h_len_to_slice : (Std.Array.to_slice arr).val.length = N.val := by
+    rw [Std.Array.val_to_slice]; exact arr.property
+  have h1' : r.end.val ≤ (Std.Array.to_slice arr).val.length := by rw [h_len_to_slice]; exact h1
+  obtain ⟨ns, hns_eq, hns_val⟩ :=
+    Slice.subslice_le_eq (Std.Array.to_slice arr) ⟨r.start, r.end⟩ h0 h1'
+  -- plain `simp` in ONE call: the body destructures `(to_slice arr, from_slice
+  -- arr)` through a pattern-`let`, which `simp only` cannot reduce.
+  simp [CoreModels.core.array.Array.as_mut_slice,
+        CoreModels.rust_primitives.slice.array_as_mut_slice,
+        Std.Array.to_slice_mut,
+        CoreModels.core.Slice.Insts.CoreOpsIndexIndexMut.index_mut,
+        CoreModels.core.ops.range.RangeUsize.Insts.CoreSliceIndexSliceIndexSliceSlice.get_unchecked_mut,
+        CoreModels.rust_primitives.slice.slice_slice_mut, hns_eq,
+        Triple, WP.wp, PredTrans.apply, bind_tc_ok,
+        Std.Do.SPred.pure, Std.Do.SPred.entails]
+  -- the same `simp` also discharges the write-back conjunct (`from_slice_val`
+  -- and the `setSlice!` length lemma are simp lemmas); the read equality and
+  -- its length remain.
+  rw [hns_val, Std.Array.val_to_slice]
+  refine ⟨rfl, ?_⟩
+  simp only [List.slice_length]
+  have := arr.property; omega
+
+/-! ### `padded_buf` — the shared 4-step buffer value.
+
+The `Array U8 200` value produced by the impl's manual 4-step buffer
+construction. -/
+def padded_buf
+    (last : Slice Std.U8) (start len i_r1 : Std.Usize) (DELIM : Std.U8) :
+    Std.Array Std.U8 200#usize :=
+  let buf0 : Std.Array Std.U8 200#usize := Std.Array.repeat 200#usize 0#u8
+  let buf1_val : List Std.U8 :=
+    if 0 < len.val then
+      buf0.val.setSlice! 0 (last.val.slice start.val (start.val + len.val))
+    else buf0.val
+  let buf1 : Std.Array Std.U8 200#usize := ⟨buf1_val, by
+    show (if 0 < len.val then buf0.val.setSlice! 0 (last.val.slice start.val (start.val + len.val))
+          else buf0.val).length = (200#usize : Std.Usize).val
+    split <;> simp [List.length_setSlice!, buf0.property]⟩
+  let buf2 : Std.Array Std.U8 200#usize := buf1.set len DELIM
+  buf2.set i_r1 (buf2.val[i_r1.val]! ||| 128#u8)
+
+/-! ### Main Triple. -/
+
+/-- `keccak.absorb_final RATE DELIM s last start len`:
+    build a 200-byte padded buffer (zero-init, copy `last[start..start+len]`,
+    write `DELIM` at offset `len`, OR `0x80` into byte `RATE-1`), then
+    load-and-permute the rate-window.
+
+    **Textbook post** (full equality form): termination, `r.i.val = 0`,
+    plus the spec equation
+    `absorbFinalLanes (lift s) last start len RATE DELIM = lift r`.
+
+    Strategy: walk impl and spec side independently as explicit
+    `.ok`-equations, then compose. Both sides produce the *same* shared
+    buffer `buf3` (the impl's manual 4-step chain and the model's
+    `padBlockList` match step-for-step).
+
+    Preconditions match the impl's `massert (len < RATE)` plus the
+    standard `RATE.val % 8 = 0`, `1 ≤ RATE.val ≤ 200`, and bounds for the
+    byte-window inside `last`. -/
+@[spec]
+theorem keccak.absorb_final_spec
+    (RATE : Std.Usize) (DELIM : Std.U8) (s : state.KeccakState)
+    (last : Slice Std.U8) (start : Std.Usize) (len : Std.Usize)
+    (h_i : s.i.val = 0)
+    (h_len_lt_RATE : len.val < RATE.val)
+    (h_RATE_mod : RATE.val % 8 = 0)
+    (h_RATE_ge_1 : 1 ≤ RATE.val)
+    (h_RATE_le_200 : RATE.val ≤ 200)
+    (h_last_len : start.val + len.val ≤ last.val.length)
+    (h_off : start.val + len.val ≤ Std.Usize.max) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.absorb_final RATE DELIM s last start len
+    ⦃ ⇓ r => ⌜ r.i.val = 0
+              ∧ absorbFinalLanes (Permutation.lift s) last.val start.val len.val
+                    RATE.val DELIM
+                  = Permutation.lift r ⌝ ⦄ := by
+  -- Common: RATE.val ≤ Std.Usize.max.
+  have h_RATE_max : RATE.val ≤ Std.Usize.max := by
+    have h200 : (200 : Nat) ≤ Std.Usize.max := by scalar_tac
+    omega
+  -- RATE - 1#usize = .ok i_r1, i_r1.val = RATE.val - 1.
+  obtain ⟨i_r1, h_i_r1_eq, h_i_r1_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.sub_bv_spec (x := RATE) (y := 1#usize) (by
+        have h1 : (1#usize : Std.Usize).val = 1 := by decide
+        rw [h1]; exact h_RATE_ge_1))
+  have h_i_r1_val : i_r1.val = RATE.val - 1 := by
+    rw [h_i_r1_val_eq]
+    show RATE.val - (1#usize : Std.Usize).val = RATE.val - 1
+    have h1 : (1#usize : Std.Usize).val = 1 := by decide
+    rw [h1]
+  have h_i_r1_lt_200 : i_r1.val < 200 := by rw [h_i_r1_val]; omega
+  -- Show existence: ∃ r, keccak.absorb_final = .ok r ∧ r.i.val = 0 ∧
+  -- absorbFinalLanes (lift s) ... = lift r.
+  suffices h_exists :
+      ∃ (r : state.KeccakState),
+        keccak.absorb_final RATE DELIM s last start len = .ok r ∧
+        r.i.val = 0 ∧
+        absorbFinalLanes (Permutation.lift s) last.val start.val len.val RATE.val DELIM
+          = Permutation.lift r by
+    obtain ⟨r, h_r_eq, h_r_i, h_r_spec⟩ := h_exists
+    exact triple_of_ok (v := r) h_r_eq ⟨h_r_i, h_r_spec⟩
+  -- Compute the buffer chain's `.ok` value.
+  -- Step values shared across branches.
+  set buf0 : Std.Array Std.U8 200#usize := Std.Array.repeat 200#usize 0#u8 with hbuf0_def
+  have h_classify_buf0 : libcrux_secrets.Array.Insts.Libcrux_secretsTraitsClassifyArray.classify libcrux_secrets.U8.Insts.Libcrux_secretsTraitsScalar buf0
+                        = (RustM.ok buf0 : RustM _) := rfl
+  have h_classify_DELIM : libcrux_secrets.traits.Classify.Blanket.classify libcrux_secrets.U8.Insts.Libcrux_secretsTraitsScalar DELIM
+                        = (RustM.ok DELIM : RustM _) := rfl
+  have h_buf0_len : buf0.val.length = 200 := buf0.property
+  have h_lift_or_eq : ∀ x : Std.U8, (Std.lift (x ||| 128#u8) : RustM Std.U8) = .ok (x ||| 128#u8) := by
+    intro x; rfl
+  have h_ma : massert (len < RATE) = .ok () := by
+    unfold massert
+    rw [if_pos (by show len < RATE; exact (Std.UScalar.lt_equiv len RATE).mpr h_len_lt_RATE)]
+  -- The buffer chain produces a `buf1` (the `if`-branch result) and from
+  -- there to `buf3`. We unify via case analysis on `len > 0`.
+  -- Build `buf1` directly as an `Array U8 200` whose `.val` matches the
+  -- if-branch's value.
+  set buf1_val : List Std.U8 :=
+    if 0 < len.val then
+      buf0.val.setSlice! 0 (last.val.slice start.val (start.val + len.val))
+    else buf0.val with hbuf1_val_def
+  have h_buf1_val_len : buf1_val.length = 200 := by
+    rw [hbuf1_val_def]; split <;> simp [List.length_setSlice!, h_buf0_len]
+  set buf1 : Std.Array Std.U8 200#usize := ⟨buf1_val, by
+    show buf1_val.length = (200#usize : Std.Usize).val
+    rw [h_buf1_val_len]; rfl⟩ with hbuf1_def
+  -- update buf1 len DELIM = .ok buf2.
+  have h_len_lt_buf1 : len.val < buf1.val.length := by
+    have : buf1.val.length = 200 := h_buf1_val_len
+    omega
+  obtain ⟨buf2, h_buf2_eq, h_buf2_set⟩ :=
+    Array.update_exists buf1 len DELIM h_len_lt_buf1
+  -- index_usize buf2 i_r1 = .ok delim_byte.
+  have h_i_r1_lt_buf2 : i_r1.val < buf2.val.length := by
+    have hlen : buf2.val.length = (200#usize : Std.Usize).val := buf2.property
+    show i_r1.val < buf2.val.length
+    rw [hlen]; show i_r1.val < 200; omega
+  obtain ⟨delim_byte, h_idx_eq, h_idx_val⟩ :=
+    Array.index_usize_exists buf2 i_r1 h_i_r1_lt_buf2
+  -- update buf2 i_r1 (delim_byte ||| 0x80) = .ok buf3.
+  obtain ⟨buf3, h_buf3_eq, h_buf3_set⟩ :=
+    Array.update_exists buf2 i_r1 (delim_byte ||| 128#u8) h_i_r1_lt_buf2
+  -- absorb_block_spec on (to_slice buf3, 0).
+  have h_blk : (0#usize : Std.Usize).val + RATE.val ≤ (Std.Array.to_slice buf3).val.length := by
+    have hlen : (Std.Array.to_slice buf3).val.length = 200 := by
+      rw [Std.Array.val_to_slice]; exact buf3.property
+    rw [hlen]; show 0 + RATE.val ≤ 200; omega
+  have h_off' : (0#usize : Std.Usize).val + RATE.val ≤ Std.Usize.max := by
+    show 0 + RATE.val ≤ Std.Usize.max; omega
+  obtain ⟨r, h_r_eq, h_r_post⟩ :=
+    triple_exists_ok
+      (keccak.absorb_block_spec RATE s (Std.Array.to_slice buf3) 0#usize
+        h_i h_RATE_mod h_RATE_le_200 h_blk h_off')
+  obtain ⟨h_r_i, h_r_spec⟩ := h_r_post
+  -- absorb_block = load_block_full + keccakf1600 (after to_slice).
+  have h_absorb_eq :
+      (do
+        let s1 ← state.KeccakState.load_block_full RATE s buf3 0#usize
+        keccak.keccakf1600 s1)
+      = keccak.absorb_block RATE s (Std.Array.to_slice buf3) 0#usize := by
+    unfold keccak.absorb_block
+    unfold state.KeccakState.load_block_full state.load_block_full_2u32
+    unfold state.KeccakState.load_block
+    show (do
+            let s1 ← (do
+                        let s2 ← Std.lift (α := Slice Std.U8) (Std.Array.to_slice buf3)
+                        state.load_block_2u32 RATE s s2 0#usize)
+            keccak.keccakf1600 s1) = (do
+            let s1 ← state.load_block_2u32 RATE s (Std.Array.to_slice buf3) 0#usize
+            keccak.keccakf1600 s1)
+    unfold Std.lift
+    show (do
+            let s1 ← (do
+                        let s2 ← (RustM.ok (Std.Array.to_slice buf3) : RustM (Slice Std.U8))
+                        state.load_block_2u32 RATE s s2 0#usize)
+            keccak.keccakf1600 s1) = _
+    simp only [bind_tc_ok]
+  -- The if-branch produces `.ok buf1`. We prove this via case analysis.
+  have h_if_eq :
+      (if len > 0#usize
+        then
+          (do
+            let (s, index_mut_back) ←
+              CoreModels.core.Array.Insts.CoreOpsIndexIndexMut.index_mut
+                (CoreModels.core.Slice.Insts.CoreOpsIndexIndexMut
+                  (CoreModels.core.ops.range.RangeUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+                    Std.U8)) buf0 { start := 0#usize, «end» := len }
+            let i ← start + len
+            let s2 ←
+              CoreModels.core.Slice.Insts.CoreOpsIndexIndex.index
+                (CoreModels.core.ops.range.RangeUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+                  Std.U8) last { start, «end» := i }
+            let s3 ←
+              CoreModels.core.slice.Slice.copy_from_slice
+                CoreModels.core.U8.Insts.CoreMarkerCopy s s2
+            ok (index_mut_back s3))
+        else (ok buf0 : RustM (Std.Array Std.U8 200#usize)))
+        = .ok buf1 := by
+    by_cases hlen : (len > 0#usize)
+    · rw [if_pos hlen]
+      have h_len_val_pos : 0 < len.val := by
+        have := (Std.UScalar.lt_equiv 0#usize len).mp hlen
+        show 0 < len.val; omega
+      have h_im_le : ((0#usize : Std.Usize).val) ≤ len.val := by show 0 ≤ len.val; omega
+      have h_im_bnd : len.val ≤ (200#usize : Std.Usize).val := by show len.val ≤ 200; omega
+      obtain ⟨p_im, h_pim_eq, h_pim_val, h_pim_len, h_pim_back⟩ :=
+        triple_exists_ok
+          (core_models_Array_Insts_index_mut_RangeUsize_spec
+            buf0 { start := 0#usize, «end» := len } h_im_le h_im_bnd)
+      rw [h_pim_eq]; simp only [bind_tc_ok]
+      obtain ⟨s_im, write_back⟩ := p_im
+      simp only at h_pim_val h_pim_len h_pim_back ⊢
+      -- The destructure pattern `let (s, im_back) := (s_im, write_back)` doesn't auto-reduce.
+      -- Use `show` to manually beta-reduce.
+      show (do
+              let i ← start + len
+              let s2 ← CoreModels.core.Slice.Insts.CoreOpsIndexIndex.index
+                (CoreModels.core.ops.range.RangeUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+                  Std.U8) last { start, «end» := i }
+              let s3 ← CoreModels.core.slice.Slice.copy_from_slice
+                CoreModels.core.U8.Insts.CoreMarkerCopy s_im s2
+              ok (write_back s3)) = _
+      obtain ⟨i_sl, h_i_sl_eq, h_i_sl_val_eq, _⟩ :=
+        Std.WP.spec_imp_exists
+          (Std.UScalar.add_bv_spec (x := start) (y := len) (by scalar_tac))
+      have h_i_sl_val : i_sl.val = start.val + len.val := h_i_sl_val_eq
+      rw [h_i_sl_eq]; simp only [bind_tc_ok]
+      have h_idx_le : start.val ≤ i_sl.val := by rw [h_i_sl_val]; omega
+      have h_idx_bnd : i_sl.val ≤ last.val.length := by rw [h_i_sl_val]; omega
+      obtain ⟨q, hq_eq, hq_val, hq_len⟩ :=
+        triple_exists_ok
+          (core_models_Slice_Insts_index_RangeUsize_spec
+            last { start, «end» := i_sl } h_idx_le h_idx_bnd)
+      rw [hq_eq]; simp only [bind_tc_ok]
+      have h_p_q_len : s_im.val.length = q.val.length := by
+        rw [h_pim_len, hq_len]
+        show len.val - (0#usize : Std.Usize).val = i_sl.val - start.val
+        rw [show ((0#usize : Std.Usize).val : Nat) = 0 from rfl, Nat.sub_zero, h_i_sl_val]
+        omega
+      obtain ⟨w, hw_eq, hw_val⟩ :=
+        triple_exists_ok
+          (core_models_slice_Slice_copy_from_slice_spec
+            s_im q h_p_q_len)
+      rw [hw_eq]; simp only [bind_tc_ok]
+      -- Conclude write_back w = buf1.
+      have h_w_val_len : w.val.length = len.val - (0#usize : Std.Usize).val := by
+        rw [hw_val, hq_len]
+        rw [show ((0#usize : Std.Usize).val : Nat) = 0 from rfl]
+        rw [show i_sl.val - start.val = len.val from by rw [h_i_sl_val]; omega]
+        rw [show len.val - 0 = len.val from by omega]
+      have h_pback := h_pim_back w h_w_val_len
+      have h_q_val_eq : q.val = last.val.slice start.val (start.val + len.val) := by
+        rw [hq_val]
+        show last.val.slice start.val i_sl.val = _
+        rw [show i_sl.val = start.val + len.val from h_i_sl_val]
+      apply Eq.symm
+      show (RustM.ok buf1 : RustM (Std.Array Std.U8 200#usize)) = RustM.ok (write_back w)
+      congr 1
+      apply Subtype.ext
+      show buf1.val = (write_back w).val
+      rw [h_pback, hw_val, h_q_val_eq]
+      rw [hbuf1_def]
+      show buf1_val = _
+      rw [hbuf1_val_def, if_pos h_len_val_pos]
+      show _ = buf0.val.setSlice! ((0#usize : Std.Usize).val) _
+      rfl
+    · rw [if_neg hlen]
+      have h_len_val_zero : len.val = 0 := by
+        have hle : ¬ (0 < len.val) := fun h => hlen ((Std.UScalar.lt_equiv 0#usize len).mpr (by show 0 < len.val; exact h))
+        omega
+      apply Eq.symm
+      show (RustM.ok buf1 : RustM (Std.Array Std.U8 200#usize)) = RustM.ok buf0
+      congr 1
+      apply Subtype.ext
+      show buf1.val = buf0.val
+      rw [hbuf1_def]; show buf1_val = buf0.val
+      rw [hbuf1_val_def, if_neg (by omega : ¬ 0 < len.val)]
+  -- The padded buffer is the model's `padBlockList`.  The specification has no
+  -- `if len > 0`: when `len = 0` the slice it copies is empty and the
+  -- write-back is the identity, which is exactly the `else` branch here.
+  have hbuf0_val : buf0.val = List.replicate 200 (0#u8) := rfl
+  have h_setSlice_nil : ∀ l : List Std.U8, l.setSlice! 0 [] = l := by
+    intro l
+    simp only [List.setSlice!, List.take_zero, List.take_nil, List.length_nil,
+      Nat.zero_min, Nat.add_zero, List.drop_zero, List.nil_append]
+  have h_buf1_pad : buf1.val
+      = (List.replicate 200 (0#u8)).setSlice! 0
+          (last.val.slice start.val (start.val + len.val)) := by
+    rw [hbuf1_def]
+    show buf1_val = _
+    rw [hbuf1_val_def]
+    by_cases h : 0 < len.val
+    · rw [if_pos h, hbuf0_val]
+    · rw [if_neg h, hbuf0_val,
+        show last.val.slice start.val (start.val + len.val) = [] from by
+          have hz : len.val = 0 := by omega
+          simp [List.slice, hz]]
+      rw [h_setSlice_nil]
+  have h_buf3_pad :
+      buf3.val = padBlockList last.val start.val len.val RATE.val DELIM := by
+    have h_delim : delim_byte = buf2.val[i_r1.val]! := by
+      rw [h_idx_val, getElem!_pos buf2.val i_r1.val h_i_r1_lt_buf2]
+    rw [h_buf3_set, h_delim, h_buf2_set, Std.Array.set_val_eq, Std.Array.set_val_eq,
+      h_buf1_pad, h_i_r1_val]
+    rfl
+  -- Compose spec sides.
+  have h_spec_eq :
+      absorbFinalLanes (Permutation.lift s) last.val start.val len.val RATE.val DELIM
+        = Permutation.lift r := by
+    unfold absorbFinalLanes
+    have hblk : (block_of_blocks (Std.Array.to_slice buf3) 0#usize RATE h_blk).val
+        = (padBlockList last.val start.val len.val RATE.val DELIM).take RATE.val := by
+      show (Std.Array.to_slice buf3).val.slice (0#usize : Std.Usize).val
+          ((0#usize : Std.Usize).val + RATE.val) = _
+      rw [Std.Array.val_to_slice, h_buf3_pad,
+        show ((0#usize : Std.Usize).val : Nat) = 0 from rfl, Nat.zero_add]
+      simp only [List.slice, List.drop_zero, Nat.sub_zero]
+    rw [← hblk]
+    exact h_r_spec
+  -- Assemble the impl-side equation.
+  refine ⟨r, ?_, h_r_i, h_spec_eq⟩
+  unfold keccak.absorb_final
+  -- Skip the `show` — work directly with the desugared form.
+  rw [h_ma]; simp only [bind_tc_ok]
+  -- `Array.repeat 200#usize 0#u8` is definitionally `buf0`, so `classify
+  -- (Array.repeat ...)` reduces. We apply `rw` directly on `classify`.
+  -- The let-bind for `a` is a `have` after simp.
+  simp only [hbuf0_def.symm]
+  rw [h_classify_buf0]; simp only [bind_tc_ok]
+  -- The `if-let-bind` desugars with __do_jp. Rewrite the if-branch's
+  -- value to `.ok buf1` directly using h_if_eq, by manipulating the
+  -- desugared form.
+  rw [h_if_eq]
+  -- Now blocks1 := buf1; continue.
+  simp only [bind_tc_ok]
+  rw [h_classify_DELIM]; simp only [bind_tc_ok]
+  rw [h_buf2_eq]; simp only [bind_tc_ok]
+  rw [h_i_r1_eq]; simp only [bind_tc_ok]
+  rw [h_idx_eq]; simp only [bind_tc_ok]
+  rw [h_lift_or_eq delim_byte]; simp only [bind_tc_ok]
+  rw [h_buf3_eq]; simp only [bind_tc_ok]
+  rw [h_absorb_eq]
+  exact h_r_eq
+
+end libcrux_iot_sha3.Sponge

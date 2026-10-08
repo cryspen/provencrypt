@@ -1,0 +1,16 @@
+[package]
+name = "libcrux-iot-sha3-spec-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Tests of libcrux-iot-sha3 against the FIPS 202 transcript"
+publish = false
+
+[dev-dependencies]
+libcrux-iot-sha3 = { path = "../annotated-upstream" }
+pedantic-sha3.workspace = true
+libcrux-secrets.workspace = true
+proptest = "1.2.0"
+
+[[test]]
+name = "spec"
+path = "spec.rs"

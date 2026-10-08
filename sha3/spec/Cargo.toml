@@ -1,0 +1,27 @@
+[package]
+name = "pedantic-sha3"
+version = "0.1.0"
+edition = "2021"
+description = "SHA-3 written the way FIPS 202 writes it: bit strings, 5x5xw state arrays, one function per numbered Algorithm"
+
+[dependencies]
+# Only for `#[hax_lib::opaque]` on `bits::BitStr` and `nat::Nat`: the extraction
+# must not see the packed representation or the `u128`, and reads the
+# hand-written Lean models instead. hax-lib's attribute macros are identity
+# macros when hax is off.
+hax-lib.workspace = true
+
+[dev-dependencies]
+hex = "0.4.3"
+sha2 = "0.10"
+proptest = "1.2.0"
+# The reference implementation and the CAVP vectors. Both come from the libcrux
+# repository, pinned by commit SHA.
+libcrux-sha3 = { git = "https://github.com/celabshq/libcrux.git", rev = "3e2f73a0a267f838268edd68c23b80d72c1c9d7d" }
+libcrux-kats = { git = "https://github.com/celabshq/libcrux.git", rev = "3e2f73a0a267f838268edd68c23b80d72c1c9d7d", features = ["sha3"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(hax)',
+    'cfg(hax_backend_lean)',
+] }

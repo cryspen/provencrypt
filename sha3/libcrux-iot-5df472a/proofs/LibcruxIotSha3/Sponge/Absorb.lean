@@ -1,0 +1,382 @@
+/-
+  # `keccak.keccak_loop0` ↔ fold of `absorbBlockLanes`
+                + `absorbRecLanes` unfold / fold characterization.
+
+  This file delivers three artifacts:
+
+  * `absorbRecLanes_unfold_short` / `absorbRecLanes_unfold_long`
+    — pure one-step unfolds of `absorbRecLanes`. The short branch picks
+    `absorbFinalLanes`; the long branch peels one full block via
+    `absorbBlockLanes` and recurses on `message[rate..]`.
+
+  * `absorbRecLanes_eq_fold` — forward characterization. After
+    `k` full blocks, `absorbRecLanes` equals the recursion on the
+    remaining suffix, started from a `Nat.fold` of `absorbBlockLanes`
+    over those blocks (`absorb_fold_spec`). Proved by induction on `k`.
+
+  * `keccak.keccak_loop0_spec` — the impl's outer "absorb full blocks"
+    loop equals `absorb_fold s data RATE n` on the lifted state. Proved by
+    `loop_range_spec_gen` (a local generalization of
+    `Hax.loop_range_spec_unsigned`) with a fold-form invariant that threads both
+    `r.i.val = 0` and the spec-fold lockstep.
+
+  ## See also
+
+  - `Sponge/AbsorbBlock.lean:keccak.absorb_block_spec` — per-block
+    Triple used in the loop body.
+  - `Hax.loop_range_spec_unsigned`.
+-/
+import LibcruxIotSha3.Sponge.AbsorbBlock
+
+open Aeneas Aeneas.Std RustM Std.Do libcrux_iot_sha3
+open LibcruxIotSha3.LaneModel
+open LibcruxIotSha3.SpongeModel
+
+namespace libcrux_iot_sha3.Sponge
+
+open libcrux_iot_sha3.Support (triple_exists_ok)
+open Hax (triple_of_ok)
+
+set_option mvcgen.warning false
+
+attribute [local spec] Aeneas.Std.uncurry
+
+open libcrux_iot_sha3.Permutation libcrux_iot_sha3.Support
+
+-- Defensive seal re-issue: no proof in this file may unfold either side
+-- of the permutation equivalence `keccakf1600_equiv_lanes`.
+attribute [local irreducible] keccak.keccakf1600 keccakFLanes
+
+/-! ## `keccak.keccak_loop0` ↔ fold of `absorbBlockLanes`. -/
+
+/-! ### Helper Triple: `RangeFromUsize` slice index.
+
+This complements `core_models_Slice_Insts_index_RangeUsize_spec` in
+`SliceSpecs.lean`, for `RangeFrom<Usize>` indices (`message[rate..]`). -/
+@[spec]
+theorem core_models_Slice_Insts_index_RangeFromUsize_spec
+    {T : Type} (s : Slice T) (r : CoreModels.core.ops.range.RangeFrom Std.Usize)
+    (h : r.start.val ≤ s.val.length) :
+    ⦃ ⌜ True ⌝ ⦄
+    CoreModels.core.Slice.Insts.CoreOpsIndexIndex.index
+      (CoreModels.core.ops.range.RangeFromUsize.Insts.CoreSliceIndexSliceIndexSliceSlice T) s r
+    ⦃ ⇓ r' => ⌜ r'.val = s.val.drop r.start.val
+                ∧ r'.val.length = s.val.length - r.start.val ⌝ ⦄ := by
+  obtain ⟨ns, hns_eq, hns_val⟩ :=
+    Slice.subslice_le_eq s ⟨r.start, s.len⟩ (by simpa [Std.Slice.len_val] using h)
+      (by simp)
+  unfold CoreModels.core.Slice.Insts.CoreOpsIndexIndex.index
+         CoreModels.core.ops.range.RangeFromUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+         CoreModels.core.ops.range.RangeFromUsize.Insts.CoreSliceIndexSliceIndexSliceSlice.get
+         CoreModels.rust_primitives.slice.slice_slice
+         CoreModels.rust_primitives.slice.slice_length
+  simp only [Triple, WP.wp, PredTrans.apply]
+  simp [hns_eq, h,Std.Slice.len,hns_val]
+  refine ⟨?_, ?_⟩
+  · unfold List.slice
+    exact List.take_of_length_le (by simp)
+  · unfold List.slice
+    rw [List.length_take, List.length_drop]
+    simp
+
+/-! ### Local helpers (re-derived from `AbsorbBlock.lean`'s private versions). -/
+
+/-- Generalizes `Hax.loop_range_spec_unsigned` to asymmetric `cont`/`done` types.
+    The `cont` branch carries `Range × β`; the `done` branch carries `γ`. -/
+private theorem loop_range_spec_gen {β γ : Type}
+    (body : (CoreModels.core.ops.range.Range Std.Usize × β) →
+      RustM (ControlFlow (CoreModels.core.ops.range.Range Std.Usize × β) γ))
+    (init : β) (s e : Std.Usize)
+    (inv : Std.Usize → β → Prop) (post : γ → Prop)
+    (h_le : s.val ≤ e.val)
+    (h_init : inv s init)
+    (h_step : ∀ acc (i : Std.Usize), s.val ≤ i.val → i.val ≤ e.val →
+      inv i acc →
+      ⦃ ⌜ True ⌝ ⦄
+      body ({ start := i, «end» := e }, acc)
+      ⦃ ⇓ r => match r with
+        | .cont (iter', acc') =>
+          ⌜ i.val < e.val ∧ iter'.«end» = e ∧ iter'.start.val = i.val + 1
+            ∧ inv iter'.start acc' ⌝
+        | .done y => ⌜ post y ⌝ ⦄) :
+    ⦃ ⌜ True ⌝ ⦄
+    loop body ({ start := s, «end» := e }, init)
+    ⦃ ⇓ r => ⌜ post r ⌝ ⦄ := by
+  suffices gen : ∀ (n : Nat) (acc : β) (k : Std.Usize),
+      e.val - k.val = n → s.val ≤ k.val → k.val ≤ e.val → inv k acc →
+      ⦃ ⌜ True ⌝ ⦄ loop body ({ start := k, «end» := e }, acc)
+      ⦃ ⇓ r => ⌜ post r ⌝ ⦄ by
+    exact gen _ init s rfl (Nat.le_refl _) h_le h_init
+  intro n
+  induction n with
+  | zero =>
+    intro acc k hn hs_le hke hinv
+    -- Extract body result and postcondition.
+    -- We case-split on `v` so that the `match v` in the post can be evaluated
+    -- before `simpa` unwraps the `.down` on each `⌜ ⌝` branch.
+    have hb : ∃ v, body ({ start := k, «end» := e }, acc) = .ok v ∧
+        (match v with
+          | .cont (iter', acc') => k.val < e.val ∧ iter'.«end» = e
+              ∧ iter'.start.val = k.val + 1 ∧ inv iter'.start acc'
+          | .done y => post y) := by
+      have hs := h_step acc k hs_le hke hinv
+      match hx : body ({ start := k, «end» := e }, acc) with
+      | .ok v =>
+          refine ⟨v, rfl, ?_⟩
+          have hhs := by rw [hx] at hs; simpa [Std.Do.Triple, WP.wp, PredTrans.apply] using hs
+          match v with
+          | .cont (iter', acc') => simpa using hhs
+          | .done y => simpa using hhs
+      | .fail _ =>
+          exfalso; have := h_step acc k hs_le hke hinv
+          simp [Std.Do.Triple, WP.wp, PredTrans.apply, hx] at this
+      | .div =>
+          exfalso; have := h_step acc k hs_le hke hinv
+          simp [Std.Do.Triple, WP.wp, PredTrans.apply, hx] at this
+    obtain ⟨r, hbody, hpost⟩ := hb
+    rw [loop.eq_def, hbody]
+    match r with
+    | .cont (iter', acc') =>
+      simp only at hpost; exact absurd hpost.1 (by omega)
+    | .done y =>
+      simp only at hpost
+      exact triple_of_ok rfl hpost
+  | succ n ih =>
+    intro acc k hn hs_le hke hinv
+    have hb : ∃ v, body ({ start := k, «end» := e }, acc) = .ok v ∧
+        (match v with
+          | .cont (iter', acc') => k.val < e.val ∧ iter'.«end» = e
+              ∧ iter'.start.val = k.val + 1 ∧ inv iter'.start acc'
+          | .done y => post y) := by
+      have hs := h_step acc k hs_le hke hinv
+      match hx : body ({ start := k, «end» := e }, acc) with
+      | .ok v =>
+          refine ⟨v, rfl, ?_⟩
+          have hhs := by rw [hx] at hs; simpa [Std.Do.Triple, WP.wp, PredTrans.apply] using hs
+          match v with
+          | .cont (iter', acc') => simpa using hhs
+          | .done y => simpa using hhs
+      | .fail _ =>
+          exfalso; have := h_step acc k hs_le hke hinv
+          simp [Std.Do.Triple, WP.wp, PredTrans.apply, hx] at this
+      | .div =>
+          exfalso; have := h_step acc k hs_le hke hinv
+          simp [Std.Do.Triple, WP.wp, PredTrans.apply, hx] at this
+    obtain ⟨r, hbody, hpost⟩ := hb
+    rw [loop.eq_def, hbody]
+    match r with
+    | .done y =>
+      simp only at hpost
+      exact triple_of_ok rfl hpost
+    | .cont (iter', acc') =>
+      simp only at hpost
+      obtain ⟨hlt, hend, hstart, hinv'⟩ := hpost
+      have hiter : iter' = { start := iter'.start, «end» := e } := by
+        cases iter'; cases hend; rfl
+      rw [hiter]
+      exact ih acc' iter'.start (by rw [hstart]; omega) (by rw [hstart]; omega)
+        (by rw [hstart]; omega) hinv'
+
+/-! ### Head and tail slices of a message. -/
+
+/-! ### Unfolding the model's absorb recursion
+
+`absorbRecLanes` is defined by exactly these two branches; naming them keeps
+the loop proofs below readable. -/
+
+/-- Short branch: `message.length < rate` ⇒ immediate `absorbFinalLanes`. -/
+theorem absorbRecLanes_unfold_short
+    (state : Lanes) (rate : Std.Usize) (delim : Std.U8) (message : Slice Std.U8)
+    (h_lt : message.val.length < rate.val) :
+    absorbRecLanes rate.val delim state message.val
+      = absorbFinalLanes state message.val 0 message.val.length rate.val delim := by
+  rw [absorbRecLanes, dif_neg (show ¬ (0 < rate.val ∧ rate.val ≤ message.val.length) from by omega)]
+
+/-- Long branch: `message.length ≥ rate` ⇒ peel one block, recurse on the tail. -/
+theorem absorbRecLanes_unfold_long
+    (state : Lanes) (rate : Std.Usize) (delim : Std.U8) (message : Slice Std.U8)
+    (h_rate : 0 < rate.val) (h_ge : rate.val ≤ message.val.length) :
+    absorbRecLanes rate.val delim state message.val
+      = absorbRecLanes rate.val delim
+          (absorbBlockLanes state (message.val.take rate.val) rate.val)
+          (message.val.drop rate.val) := by
+  conv_lhs => rw [absorbRecLanes, dif_pos (show 0 < rate.val ∧ rate.val ≤ message.val.length
+    from ⟨h_rate, h_ge⟩)]
+
+/-! ### `absorbRecLanes` ↔ `Nat.fold` characterization
+
+Peeling `k` full blocks off the recursion is `Nat.fold k` of
+`absorbBlockLanes` over those blocks, followed by the recursion on the
+suffix `msg.drop (k * rate)`.  This is what lets the implementation's
+forward-iterating loop meet the specification's recursion. -/
+
+/-- The first `k` absorb steps, as a fold. -/
+def absorb_fold_spec (state : Lanes) (msg : Slice Std.U8) (rate : Std.Usize) (k : Nat) :
+    Lanes :=
+  Nat.fold k (init := state)
+    (fun j _hj st =>
+      absorbBlockLanes st (msg.val.slice (j * rate.val) ((j + 1) * rate.val)) rate.val)
+
+theorem absorb_fold_spec_zero (state : Lanes) (msg : Slice Std.U8) (rate : Std.Usize) :
+    absorb_fold_spec state msg rate 0 = state := rfl
+
+theorem absorb_fold_spec_succ (state : Lanes) (msg : Slice Std.U8) (rate : Std.Usize) (k : Nat) :
+    absorb_fold_spec state msg rate (k + 1)
+      = absorbBlockLanes (absorb_fold_spec state msg rate k)
+          (msg.val.slice (k * rate.val) ((k + 1) * rate.val)) rate.val := by
+  unfold absorb_fold_spec
+  rw [Nat.fold_succ]
+
+theorem absorbRecLanes_eq_fold
+    (rate : Std.Usize) (delim : Std.U8) (msg : Slice Std.U8) (h_rate : 0 < rate.val)
+    (state : Lanes) (k : Nat) (h_k : k * rate.val ≤ msg.val.length) :
+    absorbRecLanes rate.val delim state msg.val
+      = absorbRecLanes rate.val delim (absorb_fold_spec state msg rate k)
+          (msg.val.drop (k * rate.val)) := by
+  induction k with
+  | zero => rw [absorb_fold_spec_zero]; simp
+  | succ k ih =>
+    have hk : k * rate.val ≤ msg.val.length := by
+      have : (k + 1) * rate.val = k * rate.val + rate.val := by ring
+      omega
+    have hge : rate.val ≤ (msg.val.drop (k * rate.val)).length := by
+      have : (k + 1) * rate.val = k * rate.val + rate.val := by ring
+      rw [List.length_drop]; omega
+    rw [ih hk,
+      absorbRecLanes_unfold_long _ rate delim
+        ⟨msg.val.drop (k * rate.val), by
+          rw [List.length_drop]; have := msg.property; omega⟩ h_rate hge,
+      absorb_fold_spec_succ]
+    show absorbRecLanes rate.val delim
+        (absorbBlockLanes (absorb_fold_spec state msg rate k)
+          ((msg.val.drop (k * rate.val)).take rate.val) rate.val)
+        ((msg.val.drop (k * rate.val)).drop rate.val) = _
+    rw [show (msg.val.drop (k * rate.val)).take rate.val
+          = msg.val.slice (k * rate.val) ((k + 1) * rate.val) from by
+        unfold List.slice
+        congr 1
+        have : (k + 1) * rate.val = k * rate.val + rate.val := by ring
+        omega,
+      List.drop_drop,
+      show k * rate.val + rate.val = (k + 1) * rate.val from by ring]
+
+/-- The fold-form invariant accumulator for `keccak_loop0`: at iteration
+    `k`, the first `k` absorb steps applied to the lifted initial state. -/
+def absorb_fold (s : state.KeccakState) (data : Slice Std.U8)
+    (RATE : Std.Usize) (k : Nat) : Lanes :=
+  absorb_fold_spec (Permutation.lift s) data RATE k
+
+theorem absorb_fold_eq_spec
+    (s : state.KeccakState) (data : Slice Std.U8) (RATE : Std.Usize) (k : Nat) :
+    absorb_fold s data RATE k
+      = absorb_fold_spec (Permutation.lift s) data RATE k := rfl
+
+@[spec]
+theorem keccak.keccak_loop0_spec
+    (RATE : Std.Usize) (s : state.KeccakState) (data : Slice Std.U8)
+    (n : Std.Usize)
+    (h_i : s.i.val = 0)
+    (h_RATE_mod : RATE.val % 8 = 0)
+    (h_RATE_bnd : RATE.val ≤ 200)
+    (h_n_RATE : n.val * RATE.val ≤ data.val.length)
+    (h_off : n.val * RATE.val ≤ Std.Usize.max) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.keccak_loop0 RATE { start := 0#usize, «end» := n } data s 0#usize
+    ⦃ ⇓ r => ⌜ r.i.val = 0
+              ∧ absorb_fold s data RATE n.val = Permutation.lift r ⌝ ⦄ := by
+  unfold keccak.keccak_loop0
+  -- Apply the generalized loop spec with accumulator β = KeccakState × Usize,
+  -- result γ = KeccakState.  The `start` field in the accumulator tracks
+  -- the byte offset so the body no longer needs `k * RATE`.
+  apply loop_range_spec_gen
+      (inv := fun k (acc : state.KeccakState × Std.Usize) =>
+          acc.1.i.val = 0
+          ∧ acc.2.val = k.val * RATE.val
+          ∧ absorb_fold s data RATE k.val = Permutation.lift acc.1)
+      (post := fun r =>
+          r.i.val = 0 ∧ absorb_fold s data RATE n.val = Permutation.lift r)
+  · -- h_le: 0 ≤ n
+    exact Nat.zero_le _
+  · -- h_init: invariant holds at k = 0 with acc = (s, 0#usize).
+    refine ⟨h_i, ?_, ?_⟩
+    · simp
+    · unfold absorb_fold; rfl
+  · -- h_step: invariant is preserved by one loop body execution.
+    intro ⟨s_k, start_k⟩ k h_ge h_le_k ⟨h_acc_i, h_acc_start, h_fold_acc⟩
+    unfold keccak.keccak_loop0.body
+    apply Std.Do.Triple.bind _ _
+      (Hax.IteratorRange_next_spec_usize k n
+        (Q := PostCond.noThrow fun (oi : Option Std.Usize × _) => ⌜
+          match oi.1 with
+          | none => k.val ≥ n.val ∧
+                    oi.2 = { start := k, «end» := n }
+          | some i => i = k ∧ k.val < n.val ∧
+                      oi.2.«end» = n ∧ oi.2.start.val = k.val + 1
+        ⌝)
+        (fun hlt s' hs' => by
+          dsimp only [PostCond.noThrow, Std.Do.SPred.down_pure]
+          exact ⟨rfl, hlt, rfl, hs'⟩)
+        (fun hge => by
+          dsimp only [PostCond.noThrow, Std.Do.SPred.down_pure]
+          exact ⟨hge, rfl⟩))
+    intro ⟨o, iter1⟩
+    apply triple_imp_intro
+    rcases o with _ | _
+    · -- None: iterator exhausted, loop done.
+      rintro ⟨hge, -⟩
+      show ⦃⌜True⌝⦄ (Aeneas.Std.RustM.ok (ControlFlow.done s_k) : RustM _) ⦃_⦄
+      have hk_eq : k.val = n.val := Nat.le_antisymm h_le_k hge
+      apply triple_of_ok (v := s_k) rfl
+      exact ⟨h_acc_i, by rw [← hk_eq]; exact h_fold_acc⟩
+    · -- Some _: one absorb_block iteration.
+      rintro ⟨-, hk_lt, hiter1_end, hiter1_start⟩
+      -- Bound facts for the absorb_block call.
+      have hk1_le_n : k.val + 1 ≤ n.val := hk_lt
+      have hk1_RATE_le : (k.val + 1) * RATE.val ≤ n.val * RATE.val := by
+        have := Nat.mul_le_mul_right RATE.val hk1_le_n; simpa using this
+      have hk_RATE_data : start_k.val + RATE.val ≤ data.val.length := by
+        rw [h_acc_start]
+        have h2 : (k.val + 1) * RATE.val = k.val * RATE.val + RATE.val := by ring
+        omega
+      have hk_RATE_max : start_k.val + RATE.val ≤ Std.Usize.max := by
+        rw [h_acc_start]
+        have h2 : (k.val + 1) * RATE.val = k.val * RATE.val + RATE.val := by ring
+        omega
+      mvcgen
+      all_goals (try scalar_tac)
+      -- Invariant preservation VC.
+      -- After mvcgen on the new body (absorb_block first, then start_k + RATE):
+      --   r   : KeccakState  (absorb_block result)
+      --   h   : r.i.val = 0 ∧ sponge.absorb_block ... = .ok (lift r)
+      --   r_1 : Usize        (start_k + RATE result)
+      --   h_1 : r_1.val = start_k.val + RATE.val  (scalar arithmetic)
+      expose_names
+      obtain ⟨h_r1_i, h_r1_spec⟩ := h
+      refine ⟨hk_lt, hiter1_end, hiter1_start, ?_⟩
+      refine ⟨h_r1_i, ?_, ?_⟩
+      · -- r_1.val = (k+1) * RATE.val
+        -- h_1 : r_1.val = start_k.val + RATE.val
+        -- h_acc_start : start_k.val = k.val * RATE.val
+        rw [hiter1_start]
+        linarith [h_acc_start, h_1,
+          show (k.val + 1) * RATE.val = k.val * RATE.val + RATE.val from by ring]
+      · -- absorb_fold s data RATE iter1.start.val = lift r.
+        rw [hiter1_start]
+        unfold absorb_fold
+        rw [absorb_fold_spec_succ]
+        have h_inner : absorb_fold_spec (Permutation.lift s) data RATE k.val
+            = Permutation.lift s_k := by
+          have := h_fold_acc; unfold absorb_fold at this; exact this
+        rw [h_inner]
+        -- Goal: absorbBlockLanes (lift s_k) (data.slice (k*RATE) ((k+1)*RATE)) RATE = lift r.
+        -- `h_r1_spec` states it with `block_of_blocks data start_k RATE _`, whose
+        -- `.val` is `data.slice start_k.val (start_k.val + RATE.val)`; the two
+        -- slices agree because `start_k.val = k * RATE.val`.
+        rw [show data.val.slice (k.val * RATE.val) ((k.val + 1) * RATE.val)
+              = (block_of_blocks data start_k RATE hk_RATE_data).val from by
+            show _ = data.val.slice start_k.val (start_k.val + RATE.val)
+            rw [h_acc_start]
+            congr 1; ring]
+        exact h_r1_spec
+
+end libcrux_iot_sha3.Sponge

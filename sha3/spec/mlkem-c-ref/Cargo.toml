@@ -1,0 +1,15 @@
+[package]
+name = "sha3-mlkem-c-ref-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Tests of the FIPS 202 transcript against the SHA-3 code of the ML-KEM C reference implementation"
+publish = false
+
+[dependencies]
+pedantic-sha3.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1.2.0"

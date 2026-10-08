@@ -1,0 +1,1070 @@
+/-
+  # Top-level `keccak.keccak` ↔ the lane model's `keccakLanes`.
+
+  Largest composition in the sponge proofs: the impl function
+  `keccak.keccak` (full pipeline: absorb-full-loop + absorb-final +
+  first-output-block + squeeze-loop + optional trailing block) matches
+  the model's `keccakLanes` byte-by-byte.
+
+  ## Post
+
+  ```
+  @[spec]
+  theorem keccak.keccak_keccak_spec
+      (RATE DELIM data out)
+      (+ side conditions) :
+      ⦃⌜True⌝⦄ keccak.keccak RATE DELIM data out
+      ⦃⇓ r => ⌜
+                  ∧ r.val.length = out.val.length
+                  ∧ ∀ k < out.val.length,
+                      r.val[k]! = (keccakLanes ⟨Slice.len out⟩ RATE DELIM data).val[k]! ⌝⦄
+  ```
+
+  Impl and spec sides are composed as independent `.ok`-equation chains,
+  then bridged byte-by-byte.
+
+  ### Impl side
+  - `keccak.keccak_loop0_spec` ⇒ `absorb_fold s data RATE n.val = lift s1`.
+  - `keccak.absorb_final_spec` ⇒ `absorbFinalLanes (lift s1) data ... = lift s2`.
+  - Case-split on `blocks = 0`:
+    - **blocks = 0** branch: `squeeze_first_and_last_spec` ⇒ output's bytes
+      come from `lift s2` (no permutation).
+    - **blocks ≥ 1** branch: `squeeze_first_block_spec` + `keccak_loop1_invariant`
+      + (`squeeze_last_spec` if `last < outlen`) ⇒ output's bytes come from
+      `keccakFLanes^[j] (lift s2)` for various `j`.
+
+  ### Spec side
+  - `absorbLanes` = `absorbRecLanes rate delim a₀ data` with `a₀ = Array.repeat 25 0`.
+    Via `absorbRecLanes_eq_fold` and `absorb_fold_eq_spec`
+    (from `Sponge/Absorb.lean`), tie to `absorb_fold s_init data RATE n.val`
+    for the new-state `s_init`.
+  - `squeezeLanes` is characterized byte-wise by `squeezeLanes_byte_eq`
+    (from `Sponge/Squeeze.lean`).
+-/
+import LibcruxIotSha3.Sponge.AbsorbFinal
+import LibcruxIotSha3.Sponge.Squeeze
+import LibcruxIotSha3.Sponge.Absorb
+import LibcruxIotSha3.Sponge.SqueezeBlock
+
+open Aeneas Aeneas.Std RustM Std.Do libcrux_iot_sha3
+open LibcruxIotSha3.LaneModel
+open LibcruxIotSha3.SpongeModel
+
+namespace libcrux_iot_sha3.Sponge
+
+open libcrux_iot_sha3.Support (triple_exists_ok)
+open Hax (triple_of_ok)
+
+open libcrux_iot_sha3.Permutation
+
+-- Defensive seal re-issue: no proof in this file may unfold either side
+-- of the permutation equivalence `keccakf1600_equiv_lanes`.
+attribute [local irreducible] keccak.keccakf1600 keccakFLanes
+
+/-! ## Top-level keccak ↔ the lane model's `keccakLanes`. -/
+
+/-! ### Local helpers. -/
+
+/-! ### Lemma: `KeccakState.new` returns a fresh zero-initialised state. -/
+
+/-- `state.KeccakState.new` always returns `.ok s_new` for the canonical
+    initial state `s_new` with `s_new.i.val = 0` and
+    `lift s_new = Array.repeat 25 0`. -/
+theorem state_KeccakState_new_eq :
+    ∃ s_new : state.KeccakState,
+      state.KeccakState.new = .ok s_new
+      ∧ s_new.i.val = 0
+      ∧ Permutation.lift s_new = Std.Array.repeat 25#usize 0#u64 := by
+  unfold state.KeccakState.new lane.Lane2U32.zero lane.Lane2U32.from_ints
+  refine ⟨_, rfl, rfl, ?_⟩
+  rfl
+
+/-! ### Helper: `CoreModels.core.slice.Slice.len` RustM-level equation. -/
+
+private theorem slice_len_eq (s : Slice Std.U8) :
+    CoreModels.core.slice.Slice.len s = .ok (Std.Slice.len s) := by
+  unfold CoreModels.core.slice.Slice.len; rfl
+
+/-! ### Helper: bridge `keccak_loop0` for the trivial n = 0 case.
+
+When `n = 0`, the impl's absorb-full-blocks loop is a no-op. We derive
+this via `keccak_loop0_spec` instantiated with `n = 0`. -/
+
+/-! ### Helper: no permutation for the first output block.
+
+When the iteration count is `0`, `keccakFLanes^[0]` is the identity. -/
+
+theorem keccakFLanes_iterate_zero (state : Lanes) :
+    keccakFLanes^[0] state = state := rfl
+
+/-! ### Main theorem: `keccak.keccak_keccak_spec` (blocks = 0 branch).
+
+This lemma lands the `blocks = 0` case end-to-end; the post is the textbook
+equality-form. The `blocks ≥ 1` case is handled separately by
+`keccak.keccak_keccak_spec_blocks_nonzero`, and the two branches are combined
+in the top-level `keccak.keccak_keccak_spec`. -/
+
+-- Set higher heartbeats for this composition Triple.
+set_option maxHeartbeats 16000000 in
+@[spec]
+theorem keccak.keccak_keccak_spec_blocks_zero
+    (RATE : Std.Usize) (DELIM : Std.U8) (data : Slice Std.U8)
+    (out : Slice Std.U8)
+    (h_RATE_mod : RATE.val % 8 = 0)
+    (h_RATE_ge_1 : 1 ≤ RATE.val)
+    (h_RATE_le_200 : RATE.val ≤ 200)
+    (h_blocks_zero : out.val.length < RATE.val) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.keccak RATE DELIM data out
+    ⦃ ⇓ r => ⌜ r.val.length = out.val.length
+              ∧ ∀ k : Nat, k < out.val.length →
+                  r.val[k]!
+                    = (keccakLanes (Std.Slice.len out) RATE.val DELIM data.val).val[k]! ⌝ ⦄ := by
+  -- Step 1: `KeccakState.new` produces canonical zero state.
+  obtain ⟨s0, h_s0_eq, h_s0_i, h_s0_lift⟩ := state_KeccakState_new_eq
+  -- Step 2: precompute the side-condition facts.
+  have h_RATE_max : RATE.val ≤ Std.Usize.max := by
+    have h200 : (200 : Nat) ≤ Std.Usize.max := by scalar_tac
+    omega
+  have h_data_len_max : data.val.length ≤ Std.Usize.max := by
+    have := data.property; omega
+  have h_out_len_max : out.val.length ≤ Std.Usize.max := by
+    have := out.property; omega
+  -- Step 3: data length decomposition.
+  -- The impl computes: i := data.length; n := i/RATE; rem := i%RATE.
+  -- So data.length = n*RATE + rem with rem < RATE.
+  set n_nat : Nat := data.val.length / RATE.val with hn_nat_def
+  set rem_nat : Nat := data.val.length % RATE.val with hrem_nat_def
+  have h_n_rem : n_nat * RATE.val + rem_nat = data.val.length := by
+    rw [hn_nat_def, hrem_nat_def]
+    exact Nat.div_add_mod' data.val.length RATE.val
+  have h_n_rate_le : n_nat * RATE.val ≤ data.val.length := by omega
+  have h_n_rate_max : n_nat * RATE.val ≤ Std.Usize.max := by
+    have := data.property; omega
+  have h_rem_lt_RATE : rem_nat < RATE.val := Nat.mod_lt _ (by omega)
+  -- Step 4: i (= data length).
+  set i_us : Std.Usize := Std.Slice.len data with hi_us_def
+  have h_i_us_val : i_us.val = data.val.length := Std.Slice.len_val data
+  have h_i_us_eq : CoreModels.core.slice.Slice.len data = .ok i_us := slice_len_eq data
+  -- Step 5: n (= i_us / RATE) = ⟨BitVec n_nat⟩.
+  have h_RATE_nz : RATE.val ≠ 0 := by omega
+  obtain ⟨n_us, h_n_us_eq, h_n_us_val_eq, _⟩ :=
+    Std.UScalar.div_bv_spec i_us (y := RATE) h_RATE_nz
+  have h_n_us_val : n_us.val = n_nat := by
+    rw [h_n_us_val_eq, h_i_us_val]
+  -- Step 6: rem = i_us % RATE.
+  obtain ⟨rem_us, h_rem_us_eq, h_rem_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.rem_bv_spec i_us (y := RATE) h_RATE_nz)
+  have h_rem_us_val : rem_us.val = rem_nat := by
+    rw [h_rem_us_val_eq, h_i_us_val]
+  -- Step 7: outlen (= Slice.len out).
+  set outlen_us : Std.Usize := Std.Slice.len out with houtlen_us_def
+  have h_outlen_us_val : outlen_us.val = out.val.length := Std.Slice.len_val out
+  have h_outlen_us_eq : CoreModels.core.slice.Slice.len out = .ok outlen_us := slice_len_eq out
+  -- Step 8: blocks (= outlen / RATE) = 0 (since outlen < RATE).
+  obtain ⟨blocks_us, h_blocks_us_eq, h_blocks_us_val_eq, _⟩ :=
+    Std.UScalar.div_bv_spec outlen_us (y := RATE) h_RATE_nz
+  have h_blocks_us_val : blocks_us.val = 0 := by
+    rw [h_blocks_us_val_eq, h_outlen_us_val]
+    exact Nat.div_eq_of_lt h_blocks_zero
+  have h_blocks_us_eq_zero : blocks_us = 0#usize :=
+    Std.UScalar.eq_of_val_eq h_blocks_us_val
+  -- Step 9: i1 (= outlen % RATE) = outlen.
+  obtain ⟨i1_us, h_i1_us_eq, h_i1_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.rem_bv_spec outlen_us (y := RATE) h_RATE_nz)
+  have h_i1_us_val : i1_us.val = out.val.length := by
+    rw [h_i1_us_val_eq, h_outlen_us_val]
+    exact Nat.mod_eq_of_lt h_blocks_zero
+  -- Step 10: last (= outlen - i1) = 0.
+  have h_i1_le_outlen : i1_us.val ≤ outlen_us.val := by
+    rw [h_i1_us_val, h_outlen_us_val]
+  obtain ⟨last_us, h_last_us_eq, h_last_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.sub_bv_spec (x := outlen_us) (y := i1_us) h_i1_le_outlen)
+  have h_last_us_val : last_us.val = 0 := by
+    rw [h_last_us_val_eq, h_outlen_us_val, h_i1_us_val]; omega
+  -- Step 11: keccak_loop0 RATE {0..n_us} data s0.
+  have h_keccak_loop0_pre_n_RATE : n_us.val * RATE.val ≤ data.val.length := by
+    rw [h_n_us_val]; exact h_n_rate_le
+  have h_keccak_loop0_pre_off : n_us.val * RATE.val ≤ Std.Usize.max := by
+    rw [h_n_us_val]; exact h_n_rate_max
+  obtain ⟨s1, h_s1_eq, h_s1_i, h_s1_fold⟩ :=
+    triple_exists_ok
+      (keccak.keccak_loop0_spec RATE s0 data n_us h_s0_i h_RATE_mod h_RATE_le_200
+        h_keccak_loop0_pre_n_RATE h_keccak_loop0_pre_off)
+  -- Step 12: absorb_final RATE DELIM s1 data (i_us - rem_us) rem_us.
+  -- i_us - rem_us = data.length - rem_nat = n_nat * RATE.
+  have h_rem_le_i : rem_us.val ≤ i_us.val := by
+    rw [h_rem_us_val, h_i_us_val]; omega
+  obtain ⟨i3_us, h_i3_us_eq, h_i3_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.sub_bv_spec (x := i_us) (y := rem_us) h_rem_le_i)
+  have h_i3_us_val : i3_us.val = n_nat * RATE.val := by
+    rw [h_i3_us_val_eq, h_i_us_val, h_rem_us_val]; omega
+  -- Absorb_final's preconditions.
+  have h_absorb_final_h_len_lt : rem_us.val < RATE.val := by rw [h_rem_us_val]; exact h_rem_lt_RATE
+  have h_absorb_final_h_last_len : i3_us.val + rem_us.val ≤ data.val.length := by
+    rw [h_i3_us_val, h_rem_us_val]; omega
+  have h_absorb_final_h_off : i3_us.val + rem_us.val ≤ Std.Usize.max := by
+    rw [h_i3_us_val, h_rem_us_val]; omega
+  obtain ⟨s2, h_s2_eq, h_s2_i, h_s2_spec⟩ :=
+    triple_exists_ok
+      (keccak.absorb_final_spec RATE DELIM s1 data i3_us rem_us h_s1_i h_absorb_final_h_len_lt
+        h_RATE_mod h_RATE_ge_1 h_RATE_le_200 h_absorb_final_h_last_len h_absorb_final_h_off)
+  -- Step 13: squeeze_first_and_last RATE s2 out.
+  have h_out_le_RATE : out.val.length ≤ RATE.val := by omega
+  obtain ⟨r_out, h_r_out_eq, h_r_out_len, h_r_out_bytes⟩ :=
+    triple_exists_ok
+      (keccak.squeeze_first_and_last_spec RATE s2 out h_RATE_mod h_RATE_le_200 h_out_le_RATE)
+  -- Step 14: impl-side equation chain → keccak.keccak ... = .ok r_out.
+  have h_impl_eq : keccak.keccak RATE DELIM data out = .ok r_out := by
+    unfold keccak.keccak
+    rw [h_i_us_eq]; simp only [bind_tc_ok]
+    rw [h_n_us_eq]; simp only [bind_tc_ok]
+    rw [h_rem_us_eq]; simp only [bind_tc_ok]
+    rw [h_outlen_us_eq]; simp only [bind_tc_ok]
+    rw [h_blocks_us_eq]; simp only [bind_tc_ok]
+    rw [h_i1_us_eq]; simp only [bind_tc_ok]
+    rw [h_last_us_eq]; simp only [bind_tc_ok]
+    rw [h_s0_eq]; simp only [bind_tc_ok]
+    rw [h_s1_eq]; simp only [bind_tc_ok]
+    -- The second `Slice.len data` call: was already collapsed by the first rw above.
+    rw [h_i3_us_eq]; simp only [bind_tc_ok]
+    rw [h_s2_eq]; simp only [bind_tc_ok]
+    -- Now the if: blocks_us = 0#usize.
+    rw [if_pos h_blocks_us_eq_zero]
+    exact h_r_out_eq
+  -- Step 15: spec-side. We want `keccakLanes outlen_us RATE DELIM data` byte-by-byte
+  -- equal to `r_out`.
+  -- keccakLanes = squeezeLanes of absorbLanes.
+  -- absorbLanes data = absorbRecLanes RATE DELIM (repeat 25 0) data.
+  -- By `absorbRecLanes_eq_fold` n_nat: this peels n_nat full absorbBlockLanes then
+  -- recurses on a tail of length rem_nat < RATE, which by `absorbRecLanes_unfold_short`
+  -- becomes `absorbFinalLanes`. Composing with `absorb_fold_eq_spec` and the impl chain
+  -- s1, s2:
+  --   absorbLanes data = lift s2.
+  -- We derive this from h_s1_fold and h_s2_spec.
+  -- h_s1_fold : absorb_fold s0 data RATE n_us.val = lift s1.
+  -- We use absorb_fold_eq_spec to translate to absorb_fold_spec (lift s0) data RATE n_us.val.
+  have h_fold_spec : absorb_fold_spec (Permutation.lift s0) data RATE n_us.val
+                      = Permutation.lift s1 := by
+    rw [← absorb_fold_eq_spec]; exact h_s1_fold
+  -- h_s2_spec : absorbFinalLanes (lift s1) data i3_us rem_us RATE DELIM = lift s2.
+  -- Now compose via absorbRecLanes_eq_fold + absorbRecLanes_unfold_short.
+  have h_absorb_eq : absorbLanes RATE.val DELIM data.val = Permutation.lift s2 := by
+    unfold absorbLanes
+    rw [← h_s0_lift]
+    rw [absorbRecLanes_eq_fold RATE DELIM data (by omega) (Permutation.lift s0) n_nat
+      (by rw [hn_nat_def]; exact h_n_rate_le)]
+    have h_fold_spec_n : absorb_fold_spec (Permutation.lift s0) data RATE n_nat
+                        = Permutation.lift s1 := by
+      rw [← h_n_us_val]; exact h_fold_spec
+    rw [h_fold_spec_n]
+    set tail : Slice Std.U8 :=
+      ⟨data.val.drop (n_nat * RATE.val), by
+        rw [List.length_drop]; have := data.property; omega⟩ with htail_def
+    have h_tail_len : tail.val.length = rem_nat := by
+      show (data.val.drop (n_nat * RATE.val)).length = _
+      rw [List.length_drop]; omega
+    have h_tail_lt_rate : tail.val.length < RATE.val := by
+      rw [h_tail_len]; exact h_rem_lt_RATE
+    rw [show data.val.drop (n_nat * RATE.val) = tail.val from rfl,
+      absorbRecLanes_unfold_short (Permutation.lift s1) RATE DELIM tail h_tail_lt_rate]
+    -- The padded last block is the same whether the tail is presented as the
+    -- suffix dropped from offset 0, or as `data` read from offset `n * RATE`.
+    have hpd : absorbFinalLanes (Permutation.lift s1) tail.val 0 tail.val.length RATE.val DELIM
+        = absorbFinalLanes (Permutation.lift s1) data.val i3_us.val rem_us.val RATE.val DELIM := by
+      show absorbFinalLanes (Permutation.lift s1) (data.val.drop (n_nat * RATE.val)) 0
+          (data.val.drop (n_nat * RATE.val)).length RATE.val DELIM = _
+      rw [show (data.val.drop (n_nat * RATE.val)).length = rem_us.val from by
+        rw [List.length_drop, h_rem_us_val]; omega]
+      unfold absorbFinalLanes
+      rw [padBlockList_drop, h_i3_us_val]
+    rw [hpd]
+    exact h_s2_spec
+  -- Step 16: spec-side squeeze: the bytes of `squeezeLanes outlen_us (lift s2) RATE`.
+  -- Use squeezeLanes_byte_eq with the constant `s_b` function (since outlen < RATE,
+  -- every k < outlen has k/RATE = 0, and keccakFLanes^[0] (lift s2) = lift s2).
+  have h_RATE_pos : 0 < RATE.val := h_RATE_ge_1
+  set s_b : Nat → Std.Array Std.U64 25#usize := fun _ => Permutation.lift s2 with hsb_def
+  have h_iter_const : ∀ k : Nat, k < outlen_us.val →
+      keccakFLanes^[k / RATE.val] (Permutation.lift s2) = s_b k := by
+    intro k hk
+    -- k < outlen_us.val = out.length < RATE.val, so k / RATE.val = 0.
+    have h_k_div : k / RATE.val = 0 := by
+      apply Nat.div_eq_of_lt
+      rw [h_outlen_us_val] at hk; omega
+    rw [h_k_div, keccakFLanes_iterate_zero]
+  have h_spec_bytes :=
+    squeezeLanes_byte_eq outlen_us (Permutation.lift s2) RATE h_RATE_pos s_b h_iter_const
+  -- Step 17: compose: `keccakLanes` is the squeeze of the absorbed state.
+  have h_spec_full_eq :
+      keccakLanes outlen_us RATE.val DELIM data.val
+        = squeezeLanes outlen_us (Permutation.lift s2) RATE.val := by
+    unfold keccakLanes
+    rw [h_absorb_eq]
+  -- Step 18: assemble post.
+  apply triple_of_ok (v := r_out) h_impl_eq
+  refine ⟨h_r_out_len, ?_⟩
+  intro k hk
+  rw [h_spec_full_eq]
+  -- spec_out.val[k]! = squeezeByteAt (s_b k) (k - (k/RATE.val) * RATE.val)
+  --   = squeezeByteAt (lift s2) (k - 0) = squeezeByteAt (lift s2) k.
+  have h_k_div : k / RATE.val = 0 := by
+    apply Nat.div_eq_of_lt; omega
+  have h_spec_byte := h_spec_bytes k (by rw [h_outlen_us_val]; exact hk)
+  rw [h_spec_byte]
+  -- Goal: r_out.val[k]! = squeezeByteAt (s_b k) (k - (k/RATE.val) * RATE.val).
+  unfold squeezeByteAt
+  rw [hsb_def]
+  rw [h_k_div]
+  show r_out.val[k]! = ⟨(BitVec.toLEBytes
+      ((Permutation.lift s2).val[(k - 0 * RATE.val) / 8]!).bv)[(k - 0 * RATE.val) % 8]!⟩
+  rw [show k - 0 * RATE.val = k from by omega]
+  exact h_r_out_bytes k hk
+
+/-! ### Main theorem: `keccak.keccak_keccak_spec` (blocks ≥ 1 branch).
+
+The `blocks ≥ 1` case requires walking through the full impl pipeline:
+`KeccakState.new → keccak_loop0 → absorb_final → squeeze_first_block →
+keccak_loop1 → (optional `squeeze_last` for partial trailing block)`.
+
+Bytes are bridged in three regions:
+- `[0, RATE)`: from `squeeze_first_block_spec` (no permutation).
+- `[RATE, last)`: from the strengthened `keccak_loop1_invariant`
+  per-byte clause (one `keccakf1600` per block).
+- `[last, outlen)` (if `last < outlen`): from `squeeze_last_spec`. -/
+
+set_option maxHeartbeats 16000000 in
+@[spec]
+theorem keccak.keccak_keccak_spec_blocks_nonzero
+    (RATE : Std.Usize) (DELIM : Std.U8) (data : Slice Std.U8)
+    (out : Slice Std.U8)
+    (h_RATE_mod : RATE.val % 8 = 0)
+    (h_RATE_ge_1 : 1 ≤ RATE.val)
+    (h_RATE_le_200 : RATE.val ≤ 200)
+    (h_blocks_nonzero : RATE.val ≤ out.val.length) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.keccak RATE DELIM data out
+    ⦃ ⇓ r => ⌜ r.val.length = out.val.length
+              ∧ ∀ k : Nat, k < out.val.length →
+                  r.val[k]!
+                    = (keccakLanes (Std.Slice.len out) RATE.val DELIM data.val).val[k]! ⌝ ⦄ := by
+  -- Step 1: KeccakState.new.
+  obtain ⟨s0, h_s0_eq, h_s0_i, h_s0_lift⟩ := state_KeccakState_new_eq
+  -- Step 2: side-condition facts.
+  have h_RATE_max : RATE.val ≤ Std.Usize.max := by
+    have h200 : (200 : Nat) ≤ Std.Usize.max := by scalar_tac
+    omega
+  have h_data_len_max : data.val.length ≤ Std.Usize.max := by
+    have := data.property; omega
+  have h_out_len_max : out.val.length ≤ Std.Usize.max := by
+    have := out.property; omega
+  -- Step 3: data length decomposition.
+  set n_nat : Nat := data.val.length / RATE.val with hn_nat_def
+  set rem_nat : Nat := data.val.length % RATE.val with hrem_nat_def
+  have h_n_rem : n_nat * RATE.val + rem_nat = data.val.length := by
+    rw [hn_nat_def, hrem_nat_def]
+    exact Nat.div_add_mod' data.val.length RATE.val
+  have h_n_rate_le : n_nat * RATE.val ≤ data.val.length := by omega
+  have h_n_rate_max : n_nat * RATE.val ≤ Std.Usize.max := by
+    have := data.property; omega
+  have h_rem_lt_RATE : rem_nat < RATE.val := Nat.mod_lt _ (by omega)
+  -- Step 4: i_us = Slice.len data.
+  set i_us : Std.Usize := Std.Slice.len data with hi_us_def
+  have h_i_us_val : i_us.val = data.val.length := Std.Slice.len_val data
+  have h_i_us_eq : CoreModels.core.slice.Slice.len data = .ok i_us := slice_len_eq data
+  -- Step 5: n_us = i_us / RATE.
+  have h_RATE_nz : RATE.val ≠ 0 := by omega
+  obtain ⟨n_us, h_n_us_eq, h_n_us_val_eq, _⟩ :=
+    Std.UScalar.div_bv_spec i_us (y := RATE) h_RATE_nz
+  have h_n_us_val : n_us.val = n_nat := by
+    rw [h_n_us_val_eq, h_i_us_val]
+  -- Step 6: rem_us = i_us % RATE.
+  obtain ⟨rem_us, h_rem_us_eq, h_rem_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.rem_bv_spec i_us (y := RATE) h_RATE_nz)
+  have h_rem_us_val : rem_us.val = rem_nat := by
+    rw [h_rem_us_val_eq, h_i_us_val]
+  -- Step 7: outlen_us = Slice.len out.
+  set outlen_us : Std.Usize := Std.Slice.len out with houtlen_us_def
+  have h_outlen_us_val : outlen_us.val = out.val.length := Std.Slice.len_val out
+  have h_outlen_us_eq : CoreModels.core.slice.Slice.len out = .ok outlen_us := slice_len_eq out
+  -- Step 8: blocks_us = outlen / RATE.
+  set blocks_nat : Nat := out.val.length / RATE.val with hblocks_nat_def
+  set i1_nat : Nat := out.val.length % RATE.val with hi1_nat_def
+  have h_blocks_pos : 1 ≤ blocks_nat := by
+    rw [hblocks_nat_def]; exact Nat.one_le_div_iff (by omega) |>.mpr h_blocks_nonzero
+  have h_blocks_outlen : blocks_nat * RATE.val + i1_nat = out.val.length := by
+    rw [hblocks_nat_def, hi1_nat_def]
+    exact Nat.div_add_mod' out.val.length RATE.val
+  have h_i1_lt : i1_nat < RATE.val := Nat.mod_lt _ (by omega)
+  obtain ⟨blocks_us, h_blocks_us_eq, h_blocks_us_val_eq, _⟩ :=
+    Std.UScalar.div_bv_spec outlen_us (y := RATE) h_RATE_nz
+  have h_blocks_us_val : blocks_us.val = blocks_nat := by
+    rw [h_blocks_us_val_eq, h_outlen_us_val]
+  have h_blocks_us_nz : ¬ blocks_us = 0#usize := by
+    intro h
+    have : blocks_us.val = 0 := by rw [h]; rfl
+    omega
+  -- Step 9: i1_us = outlen % RATE.
+  obtain ⟨i1_us, h_i1_us_eq, h_i1_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.rem_bv_spec outlen_us (y := RATE) h_RATE_nz)
+  have h_i1_us_val : i1_us.val = i1_nat := by
+    rw [h_i1_us_val_eq, h_outlen_us_val]
+  -- Step 10: last_us = outlen - i1.
+  have h_i1_le_outlen : i1_us.val ≤ outlen_us.val := by
+    rw [h_i1_us_val, h_outlen_us_val]; omega
+  obtain ⟨last_us, h_last_us_eq, h_last_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.sub_bv_spec (x := outlen_us) (y := i1_us) h_i1_le_outlen)
+  have h_last_us_val : last_us.val = blocks_nat * RATE.val := by
+    rw [h_last_us_val_eq, h_outlen_us_val, h_i1_us_val]; omega
+  -- Step 11: keccak_loop0.
+  have h_keccak_loop0_pre_n_RATE : n_us.val * RATE.val ≤ data.val.length := by
+    rw [h_n_us_val]; exact h_n_rate_le
+  have h_keccak_loop0_pre_off : n_us.val * RATE.val ≤ Std.Usize.max := by
+    rw [h_n_us_val]; exact h_n_rate_max
+  obtain ⟨s1, h_s1_eq, h_s1_i, h_s1_fold⟩ :=
+    triple_exists_ok
+      (keccak.keccak_loop0_spec RATE s0 data n_us h_s0_i h_RATE_mod h_RATE_le_200
+        h_keccak_loop0_pre_n_RATE h_keccak_loop0_pre_off)
+  -- Step 12: i3_us = i_us - rem_us.
+  have h_rem_le_i : rem_us.val ≤ i_us.val := by
+    rw [h_rem_us_val, h_i_us_val]; omega
+  obtain ⟨i3_us, h_i3_us_eq, h_i3_us_val_eq, _⟩ :=
+    Std.WP.spec_imp_exists
+      (Std.UScalar.sub_bv_spec (x := i_us) (y := rem_us) h_rem_le_i)
+  have h_i3_us_val : i3_us.val = n_nat * RATE.val := by
+    rw [h_i3_us_val_eq, h_i_us_val, h_rem_us_val]; omega
+  -- Step 13: absorb_final.
+  have h_absorb_final_h_len_lt : rem_us.val < RATE.val := by
+    rw [h_rem_us_val]; exact h_rem_lt_RATE
+  have h_absorb_final_h_last_len : i3_us.val + rem_us.val ≤ data.val.length := by
+    rw [h_i3_us_val, h_rem_us_val]; omega
+  have h_absorb_final_h_off : i3_us.val + rem_us.val ≤ Std.Usize.max := by
+    rw [h_i3_us_val, h_rem_us_val]; omega
+  obtain ⟨s2, h_s2_eq, h_s2_i, h_s2_spec⟩ :=
+    triple_exists_ok
+      (keccak.absorb_final_spec RATE DELIM s1 data i3_us rem_us h_s1_i
+        h_absorb_final_h_len_lt h_RATE_mod h_RATE_ge_1 h_RATE_le_200
+        h_absorb_final_h_last_len h_absorb_final_h_off)
+  -- Step 14: squeeze_first_block: bytes [0, RATE).
+  have h_RATE_le_out : RATE.val ≤ out.val.length := h_blocks_nonzero
+  obtain ⟨out1, h_out1_eq, h_out1_len, h_out1_bytes⟩ :=
+    triple_exists_ok
+      (keccak.squeeze_first_block_spec RATE s2 out h_RATE_mod h_RATE_le_200
+        h_RATE_le_out h_RATE_max)
+  -- Step 15: keccak_loop1 with strengthened invariant.
+  have h_loop1_offset : RATE.val + (blocks_us.val - 1) * RATE.val ≤ out1.val.length := by
+    rw [h_out1_len, h_blocks_us_val]
+    have h_arith : RATE.val + (blocks_nat - 1) * RATE.val = blocks_nat * RATE.val := by
+      have h2 : blocks_nat = (blocks_nat - 1) + 1 := by omega
+      conv_rhs => rw [h2]; rw [Nat.add_mul]
+      ring
+    rw [h_arith]; omega
+  have h_loop1_offset_max : RATE.val + (blocks_us.val - 1) * RATE.val ≤ Std.Usize.max := by
+    rw [h_blocks_us_val]
+    have h_arith : RATE.val + (blocks_nat - 1) * RATE.val = blocks_nat * RATE.val := by
+      have h2 : blocks_nat = (blocks_nat - 1) + 1 := by omega
+      conv_rhs => rw [h2]; rw [Nat.add_mul]
+      ring
+    rw [h_arith]
+    have : blocks_nat * RATE.val ≤ out.val.length := by omega
+    omega
+  have h_blocks_us_ge_1 : 1 ≤ blocks_us.val := by rw [h_blocks_us_val]; exact h_blocks_pos
+  have h_loop1_call := keccak.keccak_loop1_invariant RATE blocks_us s2 out1 RATE h_s2_i h_RATE_mod
+    h_RATE_le_200 (by show 1 ≤ RATE.val; exact h_RATE_ge_1) h_blocks_us_ge_1
+    h_loop1_offset h_loop1_offset_max
+  obtain ⟨r_loop1, h_loop1_eq, h_loop1_post⟩ := triple_exists_ok h_loop1_call
+  obtain ⟨out2, s3, offset⟩ := r_loop1
+  obtain ⟨h_out2_len, h_s3_i, h_offset_val, h_fold_blocks, h_loop_bytes, h_loop_prefix⟩ :=
+    h_loop1_post
+  -- The loop1 post: offset.val = RATE.val + (blocks_us.val - 1) * RATE.val = blocks_nat * RATE.val.
+  have h_offset_eq_last : offset.val = blocks_nat * RATE.val := by
+    rw [h_offset_val, h_blocks_us_val]
+    have h2 : blocks_nat = (blocks_nat - 1) + 1 := by omega
+    conv_rhs => rw [h2]; rw [Nat.add_mul]
+    ring
+  -- And out2.val.length = out1.val.length = out.val.length.
+  have h_out2_len_out : out2.val.length = out.val.length := by
+    rw [h_out2_len, h_out1_len]
+  -- massert side: ¬(last < outlen) ∨ (last = offset).
+  -- We have last_us.val = blocks_nat * RATE.val = offset.val.
+  have h_last_eq_offset : last_us = offset := by
+    apply Std.UScalar.eq_of_val_eq
+    rw [h_last_us_val, h_offset_eq_last]
+  have h_massert :
+      (massert ((¬ (last_us < outlen_us)) || (last_us = offset)) : RustM Unit)
+        = .ok () := by
+    unfold Aeneas.Std.massert
+    have h_or : ((¬ (last_us < outlen_us)) || (last_us = offset)) = true := by
+      rw [h_last_eq_offset]; simp
+    simp [h_last_eq_offset]
+  -- Step 16: case-split on `last < outlen`, i.e. i1 ≠ 0.
+  by_cases h_partial : last_us.val < outlen_us.val
+  · -- Partial trailing block: i1_nat > 0.
+    have h_last_lt_us : last_us < outlen_us := by
+      show last_us.val < outlen_us.val; exact h_partial
+    have h_i1_pos : 0 < i1_nat := by
+      rw [h_outlen_us_val, h_last_us_val] at h_partial; omega
+    -- Step 17: index_mut RangeFrom out2 { start := offset } ⇒ (s4, index_mut_back).
+    have h_offset_le_out2 : offset.val ≤ out2.val.length := by
+      rw [h_out2_len_out, h_offset_eq_last]; omega
+    obtain ⟨r_idx, h_idx_eq, h_s4_val, h_s4_len, h_s4_back⟩ :=
+      triple_exists_ok
+        (core_models_Slice_Insts_index_mut_RangeFromUsize_spec out2
+          { start := offset } h_offset_le_out2)
+    obtain ⟨s4, index_mut_back⟩ := r_idx
+    dsimp only at h_s4_val h_s4_len h_s4_back
+    -- s4.val.length = out2.val.length - offset.val = i1_nat.
+    have h_s4_len' : s4.val.length = i1_nat := by
+      rw [h_s4_len, h_out2_len_out, h_offset_eq_last]; omega
+    -- Step 18: squeeze_last RATE s3 s4 ⇒ s5 with per-byte equality.
+    have h_s4_le_RATE : s4.val.length ≤ RATE.val := by rw [h_s4_len']; omega
+    obtain ⟨s5, h_s5_eq, h_s5_len, s_spec_last, h_s5_kf, h_s5_bytes⟩ :=
+      triple_exists_ok
+        (keccak.squeeze_last_spec RATE s3 s4 h_s3_i h_RATE_mod h_RATE_le_200 h_s4_le_RATE)
+    -- Step 19: assemble impl chain → keccak.keccak ... = .ok (index_mut_back s5).
+    have h_impl_eq : keccak.keccak RATE DELIM data out = .ok (index_mut_back s5) := by
+      unfold keccak.keccak
+      rw [h_i_us_eq]; simp only [bind_tc_ok]
+      rw [h_n_us_eq]; simp only [bind_tc_ok]
+      rw [h_rem_us_eq]; simp only [bind_tc_ok]
+      rw [h_outlen_us_eq]; simp only [bind_tc_ok]
+      rw [h_blocks_us_eq]; simp only [bind_tc_ok]
+      rw [h_i1_us_eq]; simp only [bind_tc_ok]
+      rw [h_last_us_eq]; simp only [bind_tc_ok]
+      rw [h_s0_eq]; simp only [bind_tc_ok]
+      rw [h_s1_eq]; simp only [bind_tc_ok]
+      rw [h_i3_us_eq]; simp only [bind_tc_ok]
+      rw [h_s2_eq]; simp only [bind_tc_ok]
+      -- blocks_us ≠ 0: take else-branch.
+      rw [if_neg h_blocks_us_nz]
+      rw [h_out1_eq]; simp only [bind_tc_ok]
+      rw [h_loop1_eq]; simp only [bind_tc_ok]
+      -- The let (out2', s3', offset') := (out2, s3, offset) destructures via match.
+      -- Use a manual reduction by change:
+      change (do
+              massert ((¬ (last_us < outlen_us)) || (last_us = offset))
+              if last_us < outlen_us
+              then do
+                let (s4, index_mut_back) ←
+                  CoreModels.core.Slice.Insts.CoreOpsIndexIndexMut.index_mut
+                    (CoreModels.core.ops.range.RangeFromUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+                      Std.U8) out2 { start := offset }
+                let s5 ← keccak.squeeze_last RATE s3 s4
+                ok (index_mut_back s5)
+              else ok out2) = .ok (index_mut_back s5)
+      rw [h_massert]; simp only [bind_tc_ok]
+      rw [if_pos h_last_lt_us]
+      rw [h_idx_eq]; simp only [bind_tc_ok]
+      rw [h_s5_eq]; simp only [bind_tc_ok]
+    -- Step 20: spec-side absorb (same as blocks_zero case).
+    have h_fold_spec : absorb_fold_spec (Permutation.lift s0) data RATE n_us.val
+                        = Permutation.lift s1 := by
+      rw [← absorb_fold_eq_spec]; exact h_s1_fold
+    have h_absorb_eq : absorbLanes RATE.val DELIM data.val = Permutation.lift s2 := by
+      unfold absorbLanes
+      rw [← h_s0_lift]
+      rw [absorbRecLanes_eq_fold RATE DELIM data (by omega) (Permutation.lift s0) n_nat
+        (by rw [hn_nat_def]; exact h_n_rate_le)]
+      have h_fold_spec_n : absorb_fold_spec (Permutation.lift s0) data RATE n_nat
+                          = Permutation.lift s1 := by
+        rw [← h_n_us_val]; exact h_fold_spec
+      rw [h_fold_spec_n]
+      set tail : Slice Std.U8 :=
+        ⟨data.val.drop (n_nat * RATE.val), by
+          rw [List.length_drop]; have := data.property; omega⟩ with htail_def
+      have h_tail_len : tail.val.length = rem_nat := by
+        show (data.val.drop (n_nat * RATE.val)).length = _
+        rw [List.length_drop]; omega
+      have h_tail_lt_rate : tail.val.length < RATE.val := by
+        rw [h_tail_len]; exact h_rem_lt_RATE
+      rw [show data.val.drop (n_nat * RATE.val) = tail.val from rfl,
+        absorbRecLanes_unfold_short (Permutation.lift s1) RATE DELIM tail h_tail_lt_rate]
+      -- The padded last block is the same whether the tail is presented as the
+      -- suffix dropped from offset 0, or as `data` read from offset `n * RATE`.
+      have hpd : absorbFinalLanes (Permutation.lift s1) tail.val 0 tail.val.length RATE.val DELIM
+          = absorbFinalLanes (Permutation.lift s1) data.val i3_us.val rem_us.val RATE.val DELIM := by
+        show absorbFinalLanes (Permutation.lift s1) (data.val.drop (n_nat * RATE.val)) 0
+            (data.val.drop (n_nat * RATE.val)).length RATE.val DELIM = _
+        rw [show (data.val.drop (n_nat * RATE.val)).length = rem_us.val from by
+          rw [List.length_drop, h_rem_us_val]; omega]
+        unfold absorbFinalLanes
+        rw [padBlockList_drop, h_i3_us_val]
+      rw [hpd]
+      exact h_s2_spec
+    -- Step 21: spec-side squeeze using squeezeLanes_byte_eq.
+    have h_RATE_pos : 0 < RATE.val := h_RATE_ge_1
+    -- The s_b function: for each k < outlen, return state of iterate (k/RATE) (lift s2).
+    -- We know:
+    --   * h_fold_blocks : squeeze_fold s2 (blocks_us.val - 1) = lift s3
+    --   * For each j < (blocks_us.val - 1) * RATE.val (= last - RATE),
+    --       squeeze_fold s2 (j/RATE + 1) = s_bj.
+    -- We need, for k < outlen, iterate (k/RATE) (lift s2) = s_k where
+    --   - k < RATE: k/RATE = 0, iterate 0 (lift s2) = lift s2. s_k = lift s2.
+    --   - RATE ≤ k < last (= blocks*RATE): k/RATE ∈ [1, blocks), via squeeze_fold.
+    --   - last ≤ k < outlen: k/RATE = blocks, via iterate^blocks (lift s2) = lift s3 (then keccakFLanes (lift s3) = s_spec_last).
+    -- Use the s_b function valued at the resolved per-block states.
+    -- For the per-byte clause, we'll build s_b on case-by-case.
+    -- We use squeezeLanes_byte_eq with the s_b function set to:
+    --   k → if k < RATE then lift s2 else if k < blocks*RATE then s_bj else s_spec_last.
+    -- Define s_b directly:
+    -- Bound: blocks_nat ≤ outlen / RATE so blocks_nat ≤ Std.Usize.max.
+    have h_blocks_le_max : blocks_nat ≤ Std.Usize.max := by
+      have : blocks_nat ≤ out.val.length := by
+        rw [hblocks_nat_def]; exact Nat.div_le_self _ _
+      omega
+    -- Build the per-byte iterate witness for squeezeLanes_byte_eq.
+    -- We use a "choice" s_b: for k < outlen_us.val, it returns the appropriate state.
+    -- Helper: condition for being a "middle" k.
+    have h_middle_bound : ∀ k : Nat, RATE.val ≤ k → k < blocks_nat * RATE.val →
+        k - RATE.val < (blocks_us.val - 1) * RATE.val := by
+      intro k hk_lo hk_hi
+      rw [h_blocks_us_val]
+      have h_eq : blocks_nat * RATE.val = (blocks_nat - 1) * RATE.val + RATE.val := by
+        have h2 : blocks_nat = (blocks_nat - 1) + 1 := by omega
+        conv_lhs => rw [h2]
+        rw [Nat.add_mul, Nat.one_mul]
+      omega
+    -- Existential witness function via Classical.choice on the relevant condition.
+    let s_b : Nat → Std.Array Std.U64 25#usize := fun k =>
+      if hk_lo : RATE.val ≤ k then
+        if hk_hi : k < blocks_nat * RATE.val then
+          Classical.choose (h_loop_bytes (k - RATE.val) (h_middle_bound k hk_lo hk_hi))
+        else s_spec_last
+      else Permutation.lift s2
+    -- The condition "keccakFLanes^[k/RATE] (lift s2) = s_b k" for each region.
+    have h_iter_fold : ∀ k : Nat, k < outlen_us.val →
+        iterate_keccak_f_fold (Permutation.lift s2) (k / RATE.val) = s_b k := by
+      intro k hk
+      rw [h_outlen_us_val] at hk
+      -- Split on which region k is in.
+      by_cases hk_RATE : k < RATE.val
+      · -- Region 1: k < RATE. k/RATE = 0, iterate 0 = .ok state.
+        have hsb : s_b k = Permutation.lift s2 := by
+          show (if hk_lo : RATE.val ≤ k then _ else Permutation.lift s2) = _
+          rw [dif_neg (by omega)]
+        rw [hsb]
+        have h_div : k / RATE.val = 0 := Nat.div_eq_of_lt hk_RATE
+        rw [h_div, iterate_keccak_f_fold_zero]
+      · push Not at hk_RATE
+        by_cases hk_last : k < blocks_nat * RATE.val
+        · -- Region 2: RATE ≤ k < last. k/RATE ∈ [1, blocks).
+          have h_mb := h_middle_bound k hk_RATE hk_last
+          have hsb : s_b k = Classical.choose (h_loop_bytes (k - RATE.val) h_mb) := by
+            show (if hk_lo : RATE.val ≤ k then
+                    if hk_hi : k < blocks_nat * RATE.val then
+                      Classical.choose (h_loop_bytes (k - RATE.val)
+                        (h_middle_bound k hk_lo hk_hi))
+                    else s_spec_last
+                  else _) = _
+            rw [dif_pos hk_RATE, dif_pos hk_last]
+          rw [hsb]
+          have h_choose_spec := Classical.choose_spec (h_loop_bytes (k - RATE.val) h_mb)
+          have h_fold_eq := h_choose_spec.1
+          have hd_ge_1 : 1 ≤ k / RATE.val :=
+            (Nat.one_le_div_iff (by omega)).mpr hk_RATE
+          have h_mod_lt : k % RATE.val < RATE.val := Nat.mod_lt _ (by omega)
+          have h_kdivmod : k = k / RATE.val * RATE.val + k % RATE.val :=
+            (Nat.div_add_mod' k RATE.val).symm
+          have h_split : k / RATE.val * RATE.val
+                        = (k / RATE.val - 1) * RATE.val + RATE.val := by
+            conv_lhs => rw [show k / RATE.val = (k / RATE.val - 1) + 1 from by omega]
+            rw [Nat.add_mul, Nat.one_mul]
+          have h_eq : k - RATE.val = k % RATE.val + (k / RATE.val - 1) * RATE.val := by omega
+          have h_div_eq : (k - RATE.val) / RATE.val + 1 = k / RATE.val := by
+            have h_div_compute : (k - RATE.val) / RATE.val = k / RATE.val - 1 := by
+              rw [h_eq]
+              rw [Nat.add_mul_div_right _ _ (by omega : 0 < RATE.val)]
+              rw [Nat.div_eq_of_lt h_mod_lt]
+              omega
+            omega
+          unfold squeeze_fold at h_fold_eq
+          -- `h_fold_eq` is the fold at `(k-RATE)/RATE + 1`; `h_div_eq` says that
+          -- index is `k/RATE`.
+          have h_eq_arg : (k - RATE.val) / RATE.val + 1 = k / RATE.val := h_div_eq
+          calc iterate_keccak_f_fold (Permutation.lift s2) (k / RATE.val)
+              = iterate_keccak_f_fold (Permutation.lift s2) ((k - RATE.val) / RATE.val + 1) := by
+                rw [h_eq_arg]
+            _ = Classical.choose (h_loop_bytes (k - RATE.val) h_mb) := h_fold_eq
+        · -- Region 3: k ≥ last = blocks_nat * RATE.val. s_b k = s_spec_last.
+          push Not at hk_last
+          have hsb : s_b k = s_spec_last := by
+            show (if hk_lo : RATE.val ≤ k then
+                    if hk_hi : k < blocks_nat * RATE.val then _
+                    else s_spec_last
+                  else _) = _
+            rw [dif_pos hk_RATE, dif_neg (by omega)]
+          rw [hsb]
+          have h_div : k / RATE.val = blocks_nat := by
+            apply Nat.div_eq_of_lt_le hk_last
+            have h_kRATE : (blocks_nat + 1) * RATE.val = blocks_nat * RATE.val + RATE.val := by
+              rw [Nat.add_mul, Nat.one_mul]
+            rw [h_kRATE]
+            omega
+          rw [h_div]
+          -- `iterate^blocks (lift s2) = keccakFLanes (iterate^(blocks-1) (lift s2))`
+          -- `= keccakFLanes (lift s3) = s_spec_last`.
+          have h_blocks_eq : blocks_nat = (blocks_nat - 1) + 1 := by omega
+          rw [h_blocks_eq, iterate_keccak_f_fold_succ]
+          have h_inner : iterate_keccak_f_fold (Permutation.lift s2) (blocks_nat - 1)
+              = Permutation.lift s3 := by
+            have h_blocks_us_minus : blocks_us.val - 1 = blocks_nat - 1 := by
+              rw [h_blocks_us_val]
+            unfold squeeze_fold at h_fold_blocks
+            rw [← h_blocks_us_minus]
+            exact h_fold_blocks
+          rw [h_inner, h_s5_kf]
+    -- Step 22: compose spec-side.
+    have h_iter_const : ∀ k : Nat, k < outlen_us.val →
+        keccakFLanes^[k / RATE.val] (Permutation.lift s2) = s_b k := by
+      intro k hk
+      exact h_iter_fold k hk
+    have h_spec_bytes :=
+      squeezeLanes_byte_eq outlen_us (Permutation.lift s2) RATE h_RATE_pos s_b h_iter_const
+    have h_spec_full_eq :
+        keccakLanes outlen_us RATE.val DELIM data.val
+          = squeezeLanes outlen_us (Permutation.lift s2) RATE.val := by
+      unfold keccakLanes
+      rw [h_absorb_eq]
+    -- Step 23: assemble post.
+    apply triple_of_ok (v := index_mut_back s5) h_impl_eq
+    have h_final_len : (index_mut_back s5).val.length = out.val.length := by
+      rw [h_s4_back s5 (by omega), List.length_setSlice!, h_out2_len_out]
+    refine ⟨h_final_len, ?_⟩
+    intro k hk
+    rw [h_spec_full_eq, h_spec_bytes k (by rw [h_outlen_us_val]; exact hk)]
+    -- LHS: (index_mut_back s5).val[k]! = (out2.val.setSlice! offset.val s5.val)[k]!
+    rw [h_s4_back s5 (by omega)]
+    -- Split into 3 regions for the byte equation.
+    by_cases hk_RATE : k < RATE.val
+    · -- Region 1: k < RATE ≤ last = offset, so squeeze_last's setSlice at offset preserves k.
+      have hsb : s_b k = Permutation.lift s2 := by
+        show (if hk_lo : RATE.val ≤ k then _ else Permutation.lift s2) = _
+        rw [dif_neg (by omega)]
+      rw [hsb]
+      have h_div : k / RATE.val = 0 := Nat.div_eq_of_lt hk_RATE
+      rw [List.getElem!_setSlice!_same _ _ _ _ (Or.inl (by rw [h_offset_eq_last]; omega))]
+      have h_prefix := h_loop_prefix k hk_RATE
+      rw [h_prefix]
+      rw [h_out1_bytes k hk_RATE]
+      unfold squeezeByteAt
+      rw [h_div, Nat.zero_mul, Nat.sub_zero]
+    · push Not at hk_RATE
+      by_cases hk_last : k < blocks_nat * RATE.val
+      · -- Region 2: RATE ≤ k < last.
+        rw [List.getElem!_setSlice!_same _ _ _ _ (Or.inl (by rw [h_offset_eq_last]; omega))]
+        have h_j_lt := h_middle_bound k hk_RATE hk_last
+        obtain ⟨s_bj_loop, h_fold_loop, h_byte_loop⟩ := h_loop_bytes (k - RATE.val) h_j_lt
+        have h_RATE_plus : RATE.val + (k - RATE.val) = k := by omega
+        rw [h_RATE_plus] at h_byte_loop
+        rw [h_byte_loop]
+        have hsb : s_b k = Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt) := by
+          show (if hk_lo : RATE.val ≤ k then
+                  if hk_hi : k < blocks_nat * RATE.val then
+                    Classical.choose (h_loop_bytes (k - RATE.val)
+                      (h_middle_bound k hk_lo hk_hi))
+                  else s_spec_last
+                else _) = _
+          rw [dif_pos hk_RATE, dif_pos hk_last]
+        rw [hsb]
+        have h_choose_spec := Classical.choose_spec (h_loop_bytes (k - RATE.val) h_j_lt)
+        have h_s_b_eq : Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt) = s_bj_loop := by
+          have h1 := h_choose_spec.1
+          have h2 := h_fold_loop
+          -- h1 : squeeze_fold s2 ((k - RATE.val)/RATE.val + 1) = Classical.choose ....
+          -- h2 : squeeze_fold s2 ((k - RATE.val)/RATE.val + 1) = s_bj_loop.
+          have : (.ok (Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt)) : RustM _)
+                  = .ok s_bj_loop := by rw [← h1, h2]
+          exact (RustM.ok.injEq _ _).mp this
+        rw [h_s_b_eq]
+        have h_div_ge_1 : 1 ≤ k / RATE.val := (Nat.one_le_div_iff (by omega)).mpr hk_RATE
+        have h_kmRATE_mod : (k - RATE.val) % RATE.val = k % RATE.val := by
+          have h_rewrite : k - RATE.val = k % RATE.val + (k / RATE.val - 1) * RATE.val := by
+            have hd := Nat.div_add_mod' k RATE.val
+            have h_split : k / RATE.val * RATE.val = (k / RATE.val - 1) * RATE.val + RATE.val := by
+              conv_lhs => rw [show k / RATE.val = (k / RATE.val - 1) + 1 from by omega]
+              rw [Nat.add_mul, Nat.one_mul]
+            omega
+          rw [h_rewrite]
+          rw [Nat.add_mul_mod_self_right]
+          exact Nat.mod_eq_of_lt (Nat.mod_lt _ (by omega))
+        have h_sub_mod : k - k / RATE.val * RATE.val = k % RATE.val := by
+          have hd := Nat.div_add_mod' k RATE.val; omega
+        rw [h_kmRATE_mod, h_sub_mod]
+      · push Not at hk_last
+        -- Region 3: last ≤ k < outlen.
+        have h_off_le_k : offset.val ≤ k := by rw [h_offset_eq_last]; exact hk_last
+        have h_k_lt_outlen : k < out.val.length := hk
+        have h_k_minus_off_lt : k - offset.val < s5.val.length := by
+          rw [h_s5_len, h_s4_len', h_offset_eq_last]; omega
+        rw [List.getElem!_setSlice!_middle _ _ _ _
+          ⟨h_off_le_k, h_k_minus_off_lt, by rw [h_out2_len_out]; exact h_k_lt_outlen⟩]
+        have h_k_minus_off_lt_out : k - offset.val < s4.val.length := by
+          rw [h_s4_len', h_offset_eq_last]; omega
+        have h_s5_byte := h_s5_bytes (k - offset.val) h_k_minus_off_lt_out
+        rw [h_s5_byte]
+        have hsb : s_b k = s_spec_last := by
+          show (if hk_lo : RATE.val ≤ k then
+                  if hk_hi : k < blocks_nat * RATE.val then _
+                  else s_spec_last
+                else _) = _
+          rw [dif_pos hk_RATE, dif_neg (by omega)]
+        rw [hsb]
+        have h_k_div : k / RATE.val = blocks_nat := by
+          apply Nat.div_eq_of_lt_le hk_last
+          have h_kRATE : (blocks_nat + 1) * RATE.val = blocks_nat * RATE.val + RATE.val := by
+            rw [Nat.add_mul, Nat.one_mul]
+          rw [h_kRATE]; omega
+        have h_k_off_eq : k - offset.val = k - k / RATE.val * RATE.val := by
+          rw [h_k_div, h_offset_eq_last]
+        unfold squeezeByteAt
+        rw [h_k_off_eq]
+  · -- Else-branch: ¬(last < outlen) ⇒ i1 = 0, no partial trailing block.
+    push Not at h_partial
+    have h_last_eq_outlen : last_us.val = outlen_us.val := by
+      rw [h_last_us_val, h_outlen_us_val]; omega
+    have h_i1_zero : i1_nat = 0 := by
+      rw [h_outlen_us_val, h_last_us_val] at h_partial
+      omega
+    have h_outlen_eq_last : out.val.length = blocks_nat * RATE.val := by omega
+    have h_not_partial : ¬ (last_us < outlen_us) := by
+      intro h; exact absurd h (by show ¬ last_us.val < outlen_us.val; omega)
+    have h_impl_eq : keccak.keccak RATE DELIM data out = .ok out2 := by
+      unfold keccak.keccak
+      rw [h_i_us_eq]; simp only [bind_tc_ok]
+      rw [h_n_us_eq]; simp only [bind_tc_ok]
+      rw [h_rem_us_eq]; simp only [bind_tc_ok]
+      rw [h_outlen_us_eq]; simp only [bind_tc_ok]
+      rw [h_blocks_us_eq]; simp only [bind_tc_ok]
+      rw [h_i1_us_eq]; simp only [bind_tc_ok]
+      rw [h_last_us_eq]; simp only [bind_tc_ok]
+      rw [h_s0_eq]; simp only [bind_tc_ok]
+      rw [h_s1_eq]; simp only [bind_tc_ok]
+      rw [h_i3_us_eq]; simp only [bind_tc_ok]
+      rw [h_s2_eq]; simp only [bind_tc_ok]
+      rw [if_neg h_blocks_us_nz]
+      rw [h_out1_eq]; simp only [bind_tc_ok]
+      rw [h_loop1_eq]; simp only [bind_tc_ok]
+      change (do
+              massert ((¬ (last_us < outlen_us)) || (last_us = offset))
+              if last_us < outlen_us
+              then do
+                let (s4, index_mut_back) ←
+                  CoreModels.core.Slice.Insts.CoreOpsIndexIndexMut.index_mut
+                    (CoreModels.core.ops.range.RangeFromUsize.Insts.CoreSliceIndexSliceIndexSliceSlice
+                      Std.U8) out2 { start := offset }
+                let s5 ← keccak.squeeze_last RATE s3 s4
+                ok (index_mut_back s5)
+              else ok out2) = .ok out2
+      rw [h_massert]; simp only [bind_tc_ok]
+      rw [if_neg h_not_partial]
+    -- Spec-side absorb (same as partial branch).
+    have h_fold_spec : absorb_fold_spec (Permutation.lift s0) data RATE n_us.val
+                        = Permutation.lift s1 := by
+      rw [← absorb_fold_eq_spec]; exact h_s1_fold
+    have h_absorb_eq : absorbLanes RATE.val DELIM data.val = Permutation.lift s2 := by
+      unfold absorbLanes
+      rw [← h_s0_lift]
+      rw [absorbRecLanes_eq_fold RATE DELIM data (by omega) (Permutation.lift s0) n_nat
+        (by rw [hn_nat_def]; exact h_n_rate_le)]
+      have h_fold_spec_n : absorb_fold_spec (Permutation.lift s0) data RATE n_nat
+                          = Permutation.lift s1 := by
+        rw [← h_n_us_val]; exact h_fold_spec
+      rw [h_fold_spec_n]
+      set tail : Slice Std.U8 :=
+        ⟨data.val.drop (n_nat * RATE.val), by
+          rw [List.length_drop]; have := data.property; omega⟩ with htail_def
+      have h_tail_len : tail.val.length = rem_nat := by
+        show (data.val.drop (n_nat * RATE.val)).length = _
+        rw [List.length_drop]; omega
+      have h_tail_lt_rate : tail.val.length < RATE.val := by
+        rw [h_tail_len]; exact h_rem_lt_RATE
+      rw [show data.val.drop (n_nat * RATE.val) = tail.val from rfl,
+        absorbRecLanes_unfold_short (Permutation.lift s1) RATE DELIM tail h_tail_lt_rate]
+      -- The padded last block is the same whether the tail is presented as the
+      -- suffix dropped from offset 0, or as `data` read from offset `n * RATE`.
+      have hpd : absorbFinalLanes (Permutation.lift s1) tail.val 0 tail.val.length RATE.val DELIM
+          = absorbFinalLanes (Permutation.lift s1) data.val i3_us.val rem_us.val RATE.val DELIM := by
+        show absorbFinalLanes (Permutation.lift s1) (data.val.drop (n_nat * RATE.val)) 0
+            (data.val.drop (n_nat * RATE.val)).length RATE.val DELIM = _
+        rw [show (data.val.drop (n_nat * RATE.val)).length = rem_us.val from by
+          rw [List.length_drop, h_rem_us_val]; omega]
+        unfold absorbFinalLanes
+        rw [padBlockList_drop, h_i3_us_val]
+      rw [hpd]
+      exact h_s2_spec
+    -- Spec-side squeeze (no region 3; outlen = blocks * RATE).
+    have h_RATE_pos : 0 < RATE.val := h_RATE_ge_1
+    have h_blocks_le_max : blocks_nat ≤ Std.Usize.max := by
+      have : blocks_nat ≤ out.val.length := by
+        rw [hblocks_nat_def]; exact Nat.div_le_self _ _
+      omega
+    have h_middle_bound : ∀ k : Nat, RATE.val ≤ k → k < blocks_nat * RATE.val →
+        k - RATE.val < (blocks_us.val - 1) * RATE.val := by
+      intro k hk_lo hk_hi
+      rw [h_blocks_us_val]
+      have h_eq : blocks_nat * RATE.val = (blocks_nat - 1) * RATE.val + RATE.val := by
+        have h2 : blocks_nat = (blocks_nat - 1) + 1 := by omega
+        conv_lhs => rw [h2]
+        rw [Nat.add_mul, Nat.one_mul]
+      omega
+    let s_b : Nat → Std.Array Std.U64 25#usize := fun k =>
+      if hk_lo : RATE.val ≤ k then
+        if hk_hi : k < blocks_nat * RATE.val then
+          Classical.choose (h_loop_bytes (k - RATE.val) (h_middle_bound k hk_lo hk_hi))
+        else Permutation.lift s3
+      else Permutation.lift s2
+    have h_iter_fold : ∀ k : Nat, k < outlen_us.val →
+        iterate_keccak_f_fold (Permutation.lift s2) (k / RATE.val) = s_b k := by
+      intro k hk
+      rw [h_outlen_us_val] at hk
+      by_cases hk_RATE : k < RATE.val
+      · have hsb : s_b k = Permutation.lift s2 := by
+          show (if hk_lo : RATE.val ≤ k then _ else Permutation.lift s2) = _
+          rw [dif_neg (by omega)]
+        rw [hsb]
+        have h_div : k / RATE.val = 0 := Nat.div_eq_of_lt hk_RATE
+        rw [h_div, iterate_keccak_f_fold_zero]
+      · push Not at hk_RATE
+        have hk_last : k < blocks_nat * RATE.val := by rw [h_outlen_eq_last] at hk; exact hk
+        have h_mb := h_middle_bound k hk_RATE hk_last
+        have hsb : s_b k = Classical.choose (h_loop_bytes (k - RATE.val) h_mb) := by
+          show (if hk_lo : RATE.val ≤ k then
+                  if hk_hi : k < blocks_nat * RATE.val then
+                    Classical.choose (h_loop_bytes (k - RATE.val)
+                      (h_middle_bound k hk_lo hk_hi))
+                  else _
+                else _) = _
+          rw [dif_pos hk_RATE, dif_pos hk_last]
+        rw [hsb]
+        have h_choose_spec := Classical.choose_spec (h_loop_bytes (k - RATE.val) h_mb)
+        have h_fold_eq := h_choose_spec.1
+        have hd_ge_1 : 1 ≤ k / RATE.val := (Nat.one_le_div_iff (by omega)).mpr hk_RATE
+        have h_mod_lt : k % RATE.val < RATE.val := Nat.mod_lt _ (by omega)
+        have h_kdivmod : k = k / RATE.val * RATE.val + k % RATE.val :=
+          (Nat.div_add_mod' k RATE.val).symm
+        have h_split : k / RATE.val * RATE.val
+                      = (k / RATE.val - 1) * RATE.val + RATE.val := by
+          conv_lhs => rw [show k / RATE.val = (k / RATE.val - 1) + 1 from by omega]
+          rw [Nat.add_mul, Nat.one_mul]
+        have h_eq : k - RATE.val = k % RATE.val + (k / RATE.val - 1) * RATE.val := by omega
+        have h_div_eq : (k - RATE.val) / RATE.val + 1 = k / RATE.val := by
+          have h_div_compute : (k - RATE.val) / RATE.val = k / RATE.val - 1 := by
+            rw [h_eq]
+            rw [Nat.add_mul_div_right _ _ (by omega : 0 < RATE.val)]
+            rw [Nat.div_eq_of_lt h_mod_lt]
+            omega
+          omega
+        unfold squeeze_fold at h_fold_eq
+        calc iterate_keccak_f_fold (Permutation.lift s2) (k / RATE.val)
+            = iterate_keccak_f_fold (Permutation.lift s2) ((k - RATE.val) / RATE.val + 1) := by
+              rw [h_div_eq]
+          _ = Classical.choose (h_loop_bytes (k - RATE.val) h_mb) := h_fold_eq
+    have h_iter_const : ∀ k : Nat, k < outlen_us.val →
+        keccakFLanes^[k / RATE.val] (Permutation.lift s2) = s_b k := by
+      intro k hk
+      exact h_iter_fold k hk
+    have h_spec_bytes :=
+      squeezeLanes_byte_eq outlen_us (Permutation.lift s2) RATE h_RATE_pos s_b h_iter_const
+    have h_spec_full_eq :
+        keccakLanes outlen_us RATE.val DELIM data.val
+          = squeezeLanes outlen_us (Permutation.lift s2) RATE.val := by
+      unfold keccakLanes
+      rw [h_absorb_eq]
+    apply triple_of_ok (v := out2) h_impl_eq
+    refine ⟨h_out2_len_out, ?_⟩
+    intro k hk
+    rw [h_spec_full_eq, h_spec_bytes k (by rw [h_outlen_us_val]; exact hk)]
+    by_cases hk_RATE : k < RATE.val
+    · -- Region 1.
+      have hsb : s_b k = Permutation.lift s2 := by
+        show (if hk_lo : RATE.val ≤ k then _ else Permutation.lift s2) = _
+        rw [dif_neg (by omega)]
+      rw [hsb]
+      have h_div : k / RATE.val = 0 := Nat.div_eq_of_lt hk_RATE
+      have h_prefix := h_loop_prefix k hk_RATE
+      rw [h_prefix]
+      rw [h_out1_bytes k hk_RATE]
+      unfold squeezeByteAt
+      rw [h_div, Nat.zero_mul, Nat.sub_zero]
+    · push Not at hk_RATE
+      have hk_last : k < blocks_nat * RATE.val := by rw [h_outlen_eq_last] at hk; exact hk
+      have h_j_lt := h_middle_bound k hk_RATE hk_last
+      obtain ⟨s_bj_loop, h_fold_loop, h_byte_loop⟩ := h_loop_bytes (k - RATE.val) h_j_lt
+      have h_RATE_plus : RATE.val + (k - RATE.val) = k := by omega
+      rw [h_RATE_plus] at h_byte_loop
+      rw [h_byte_loop]
+      have hsb : s_b k = Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt) := by
+        show (if hk_lo : RATE.val ≤ k then
+                if hk_hi : k < blocks_nat * RATE.val then
+                  Classical.choose (h_loop_bytes (k - RATE.val)
+                    (h_middle_bound k hk_lo hk_hi))
+                else _
+              else _) = _
+        rw [dif_pos hk_RATE, dif_pos hk_last]
+      rw [hsb]
+      have h_choose_spec := Classical.choose_spec (h_loop_bytes (k - RATE.val) h_j_lt)
+      have h_s_b_eq : Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt) = s_bj_loop := by
+        have h1 := h_choose_spec.1
+        have h2 := h_fold_loop
+        have : (.ok (Classical.choose (h_loop_bytes (k - RATE.val) h_j_lt)) : RustM _)
+                = .ok s_bj_loop := by rw [← h1, h2]
+        exact (RustM.ok.injEq _ _).mp this
+      rw [h_s_b_eq]
+      have h_div_ge_1 : 1 ≤ k / RATE.val := (Nat.one_le_div_iff (by omega)).mpr hk_RATE
+      have h_kmRATE_mod : (k - RATE.val) % RATE.val = k % RATE.val := by
+        have h_rewrite : k - RATE.val = k % RATE.val + (k / RATE.val - 1) * RATE.val := by
+          have hd := Nat.div_add_mod' k RATE.val
+          have h_split : k / RATE.val * RATE.val = (k / RATE.val - 1) * RATE.val + RATE.val := by
+            conv_lhs => rw [show k / RATE.val = (k / RATE.val - 1) + 1 from by omega]
+            rw [Nat.add_mul, Nat.one_mul]
+          omega
+        rw [h_rewrite]
+        rw [Nat.add_mul_mod_self_right]
+        exact Nat.mod_eq_of_lt (Nat.mod_lt _ (by omega))
+      have h_sub_mod : k - k / RATE.val * RATE.val = k % RATE.val := by
+        have hd := Nat.div_add_mod' k RATE.val; omega
+      rw [h_kmRATE_mod, h_sub_mod]
+
+/-! ### Combined dispatcher: `keccak.keccak_keccak_spec`.
+
+Case-splits on `out.val.length < RATE.val` to dispatch to either
+`keccak_keccak_spec_blocks_zero` or `keccak_keccak_spec_blocks_nonzero`. -/
+
+@[spec]
+theorem keccak.keccak_keccak_spec
+    (RATE : Std.Usize) (DELIM : Std.U8) (data : Slice Std.U8)
+    (out : Slice Std.U8)
+    (h_RATE_mod : RATE.val % 8 = 0)
+    (h_RATE_ge_1 : 1 ≤ RATE.val)
+    (h_RATE_le_200 : RATE.val ≤ 200) :
+    ⦃ ⌜ True ⌝ ⦄
+    keccak.keccak RATE DELIM data out
+    ⦃ ⇓ r => ⌜ r.val.length = out.val.length
+              ∧ ∀ k : Nat, k < out.val.length →
+                  r.val[k]!
+                    = (keccakLanes (Std.Slice.len out) RATE.val DELIM data.val).val[k]! ⌝ ⦄ := by
+  by_cases h : out.val.length < RATE.val
+  · exact keccak.keccak_keccak_spec_blocks_zero RATE DELIM data out
+      h_RATE_mod h_RATE_ge_1 h_RATE_le_200 h
+  · push Not at h
+    exact keccak.keccak_keccak_spec_blocks_nonzero RATE DELIM data out
+      h_RATE_mod h_RATE_ge_1 h_RATE_le_200 h
+
+/-! ## Axiom guards
+    Pinned by `#guard_msgs`: the build fails if a result comes to depend on any axiom
+    beyond Lean's standard three (an admitted `sorry`, or `Lean.ofReduceBool` from
+    `bv_decide`/`native_decide`). -/
+/--
+info: 'libcrux_iot_sha3.Sponge.keccak.keccak_keccak_spec' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms keccak.keccak_keccak_spec
+
+end libcrux_iot_sha3.Sponge

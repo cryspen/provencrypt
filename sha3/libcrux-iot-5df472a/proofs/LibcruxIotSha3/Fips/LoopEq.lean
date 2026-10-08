@@ -1,0 +1,884 @@
+import LibcruxIotSha3.Fips.StateMap
+-- `Hax.IteratorRange_next_spec{,_usize}`: hax-lean's `Iterator::next` triples for
+-- the half-open `Range` at `I32`/`Usize`, which the equations below are built on.
+import Hax
+/-!
+# Equational loop-over-range lemma
+
+The pedantic step mappings are nests of `for x in 0..5 { for y in 0..5 { for z
+in 0..w { .. } } }`, and hax extracts each `for` into an Aeneas `loop` fixpoint
+over a `Range Usize` iterator.  The hax library ships Hoare-triple lemmas for
+those (`Hax.loop_range_spec_unsigned`), but they require the loop's accumulator
+and its result to have the same type, and these loops return a *pair* (the
+unchanged input state array alongside the output one) while accumulating only
+the output.  They are also total and deterministic, which makes an equation more
+useful downstream than a triple: the step-mapping characterisations are
+equations, and equations compose by `rw`.
+
+`loop_range_eq` is that equation.  Read it as a backwards induction: `P i acc r`
+says "running the loop from index `i` with accumulator `acc` yields `r`", the
+step hypothesis says one iteration turns the goal at `i` into the goal at
+`i + 1`, and the conclusion is the run from any `i` with `e - i` iterations
+left.
+-/
+
+open CoreModels Aeneas
+open Aeneas.Std hiding namespace core alloc
+open RustM ControlFlow
+open Std.Do
+
+namespace LibcruxIotSha3.Fips
+
+set_option mvcgen.warning false
+
+-- `scalar_tac` normalises the `i64` bounds through `2 ^ 63`, which overruns the
+-- default recursion limit in the `imod` proof.
+set_option maxRecDepth 8000
+
+/-- The induction itself, over any index type: `val` reads an index as an
+    integer, `Inv` is whatever the accumulator has to satisfy for the body to
+    behave (ρ needs it -- its accumulator carries the lane the walk has reached),
+    and `P i acc r` says "running from `i` with `acc` yields `r`". -/
+theorem loop_range_eq_inv {ι β γ : Type} (val : ι → Int)
+    (hinj : ∀ i j : ι, val i = val j → i = j)
+    (body : (core.ops.range.Range ι × β) →
+      RustM (ControlFlow (core.ops.range.Range ι × β) γ))
+    (e : ι) (Inv : ι → β → Prop) (P : ι → β → γ → Prop)
+    (hstep : ∀ (i : ι) (acc : β), val i < val e → Inv i acc →
+      ∃ (s : ι) (acc' : β), val s = val i + 1 ∧ Inv s acc' ∧
+        body ({ start := i, «end» := e }, acc)
+          = ok (.cont ({ start := s, «end» := e }, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (acc : β), Inv e acc →
+      ∃ r, body ({ start := e, «end» := e }, acc) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : ι) (acc : β), val i + k = val e → Inv i acc →
+      ∃ r, loop body ({ start := i, «end» := e }, acc) = ok r ∧ P i acc r := by
+  intro k
+  induction k with
+  | zero =>
+    intro i acc hik hinv
+    have hie : i = e := hinj i e (by omega)
+    subst hie
+    obtain ⟨r, hb, hP⟩ := hdone acc hinv
+    exact ⟨r, by rw [loop.eq_def, hb], hP⟩
+  | succ k ih =>
+    intro i acc hik hinv
+    obtain ⟨s, acc', hs, hinv', hb, hP⟩ := hstep i acc (by omega) hinv
+    obtain ⟨r, hr, hPr⟩ := ih s acc' (by omega) hinv'
+    exact ⟨r, by rw [loop.eq_def, hb]; exact hr, hP r hPr⟩
+
+/-! ## Counter loops
+
+The transcript's absorb loop is a `while i < blocks` over a counter, not a `for`
+over a range: the block count of an arbitrary-length message is a `nat::Nat`,
+which is not an index type. The induction is the same shape as
+`loop_range_eq_inv`, with the counter inside the accumulator instead of an
+iterator beside it — which makes it shorter, since there is no `next` to
+discharge, and the counter is a `Nat`, so the successor needs no `val` of its
+own. -/
+theorem loop_counter_eq_inv_nat {β γ : Type}
+    (body : (β × Nat) → RustM (ControlFlow (β × Nat) γ))
+    (e : Nat) (Inv : Nat → β → Prop) (P : Nat → β → γ → Prop)
+    (hstep : ∀ (i : Nat) (acc : β), i < e → Inv i acc →
+      ∃ acc' : β, Inv (i + 1) acc' ∧
+        body (acc, i) = ok (.cont (acc', i + 1)) ∧
+        ∀ r, P (i + 1) acc' r → P i acc r)
+    (hdone : ∀ (acc : β), Inv e acc →
+      ∃ r, body (acc, e) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : Nat) (acc : β), i + k = e → Inv i acc →
+      ∃ r, loop body (acc, i) = ok r ∧ P i acc r := by
+  intro k
+  induction k with
+  | zero =>
+    intro i acc hik hinv
+    have hie : i = e := by omega
+    subst hie
+    obtain ⟨r, hb, hP⟩ := hdone acc hinv
+    exact ⟨r, by rw [loop.eq_def, hb], hP⟩
+  | succ k ih =>
+    intro i acc hik hinv
+    obtain ⟨acc', hinv', hb, hP⟩ := hstep i acc (by omega) hinv
+    obtain ⟨r, hr, hPr⟩ := ih (i + 1) acc' (by omega) hinv'
+    exact ⟨r, by rw [loop.eq_def, hb]; exact hr, hP r hPr⟩
+
+/-- The invariant-free version, for the loops whose bodies behave on any
+    accumulator. -/
+theorem loop_range_eq_gen {ι β γ : Type} (val : ι → Int)
+    (hinj : ∀ i j : ι, val i = val j → i = j)
+    (body : (core.ops.range.Range ι × β) →
+      RustM (ControlFlow (core.ops.range.Range ι × β) γ))
+    (e : ι) (P : ι → β → γ → Prop)
+    (hstep : ∀ (i : ι) (acc : β), val i < val e →
+      ∃ (s : ι) (acc' : β), val s = val i + 1 ∧
+        body ({ start := i, «end» := e }, acc)
+          = ok (.cont ({ start := s, «end» := e }, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (acc : β),
+      ∃ r, body ({ start := e, «end» := e }, acc) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : ι) (acc : β), val i + k = val e →
+      ∃ r, loop body ({ start := i, «end» := e }, acc) = ok r ∧ P i acc r := by
+  intro k i acc hik
+  refine loop_range_eq_inv val hinj body e (fun _ _ => True) P ?_ (fun acc _ => hdone acc)
+    k i acc hik trivial
+  intro j acc' hj _
+  obtain ⟨s, acc'', hs, hb, hP⟩ := hstep j acc' hj
+  exact ⟨s, acc'', hs, trivial, hb, hP⟩
+
+/-- The `Usize` instance, the one the `for x in 0..5` nests use. -/
+theorem loop_range_eq {β γ : Type}
+    (body : (core.ops.range.Range Std.Usize × β) →
+      RustM (ControlFlow (core.ops.range.Range Std.Usize × β) γ))
+    (e : Std.Usize) (P : Std.Usize → β → γ → Prop)
+    (hstep : ∀ (i : Std.Usize) (acc : β), i.val < e.val →
+      ∃ (s : Std.Usize) (acc' : β), s.val = i.val + 1 ∧
+        body ({ start := i, «end» := e }, acc)
+          = ok (.cont ({ start := s, «end» := e }, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (acc : β),
+      ∃ r, body ({ start := e, «end» := e }, acc) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : Std.Usize) (acc : β), i.val + k = e.val →
+      ∃ r, loop body ({ start := i, «end» := e }, acc) = ok r ∧ P i acc r := by
+  intro k i acc hik
+  refine loop_range_eq_gen (fun x : Std.Usize => (x.val : Int))
+    (fun i j h => (Std.UScalar.eq_equiv i j).mpr (by omega)) body e P ?_ hdone k i acc (by omega)
+  intro j acc' hj
+  obtain ⟨s, acc'', hs, hb, hP⟩ := hstep j acc' (by omega)
+  exact ⟨s, acc'', by omega, hb, hP⟩
+
+/-- The `Usize` instance with an invariant. -/
+theorem loop_range_eq_inv_usize {β γ : Type}
+    (body : (core.ops.range.Range Std.Usize × β) →
+      RustM (ControlFlow (core.ops.range.Range Std.Usize × β) γ))
+    (e : Std.Usize) (Inv : Std.Usize → β → Prop) (P : Std.Usize → β → γ → Prop)
+    (hstep : ∀ (i : Std.Usize) (acc : β), i.val < e.val → Inv i acc →
+      ∃ (s : Std.Usize) (acc' : β), s.val = i.val + 1 ∧ Inv s acc' ∧
+        body ({ start := i, «end» := e }, acc)
+          = ok (.cont ({ start := s, «end» := e }, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (acc : β), Inv e acc →
+      ∃ r, body ({ start := e, «end» := e }, acc) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : Std.Usize) (acc : β), i.val + k = e.val → Inv i acc →
+      ∃ r, loop body ({ start := i, «end» := e }, acc) = ok r ∧ P i acc r := by
+  intro k i acc hik hinv
+  refine loop_range_eq_inv (fun x : Std.Usize => (x.val : Int))
+    (fun i j h => (Std.UScalar.eq_equiv i j).mpr (by omega)) body e Inv P ?_ hdone
+    k i acc (by omega) hinv
+  intro j acc' hj hinv'
+  obtain ⟨s, acc'', hs, hinv'', hb, hP⟩ := hstep j acc' (by omega) hinv'
+  exact ⟨s, acc'', by omega, hinv'', hb, hP⟩
+
+/-! ## `Iterator::next` on a `Range Usize`, as equations
+
+`Hax.IteratorRange_next_spec_usize` states this as a Hoare triple; the loops
+below need it as an equation, which the triple gives up via
+`Hax.triple_noThrow_exists_ok` (the call cannot fail) plus
+`Hax.triple_noThrow_elim` (its value is the one the post describes). -/
+
+theorem range_next_lt (i e : Std.Usize) (h : i.val < e.val) :
+    ∃ s : Std.Usize, s.val = i.val + 1 ∧
+      core.ops.range.Range.Insts.CoreIterTraitsIteratorIterator.next
+        core.Usize.Insts.CoreIterRangeStep { start := i, «end» := e }
+        = ok (some i, { start := s, «end» := e }) := by
+  have ht := Hax.IteratorRange_next_spec_usize (Q := PostCond.noThrow fun p =>
+      ⌜ ∃ s : Std.Usize, s.val = i.val + 1 ∧ p = (some i, { start := s, «end» := e }) ⌝)
+    i e (fun _ s hs => ⟨s, hs, rfl⟩) (fun hge => absurd h (by omega))
+  obtain ⟨v, hv⟩ := Hax.triple_noThrow_exists_ok ht
+  obtain ⟨s, hs, hveq⟩ := Hax.triple_noThrow_elim ht hv
+  refine ⟨s, hs, ?_⟩
+  show core.IteratorRange.next _ _ = _
+  rw [hv, hveq]
+
+theorem range_next_ge (i e : Std.Usize) (h : e.val ≤ i.val) :
+    core.ops.range.Range.Insts.CoreIterTraitsIteratorIterator.next
+      core.Usize.Insts.CoreIterRangeStep { start := i, «end» := e }
+      = ok (none, { start := i, «end» := e }) := by
+  have ht := Hax.IteratorRange_next_spec_usize (Q := PostCond.noThrow fun p =>
+      ⌜ p = (none, { start := i, «end» := e }) ⌝)
+    i e (fun hlt _ _ => absurd hlt (by omega)) (fun _ => rfl)
+  obtain ⟨v, hv⟩ := Hax.triple_noThrow_exists_ok ht
+  have hveq := Hax.triple_noThrow_elim ht hv
+  show core.IteratorRange.next _ _ = _
+  rw [hv, hveq]
+
+/-! ## Reads and index arithmetic, as equations
+
+The loop bodies read the state array with `Array.index_usize` and compute
+neighbour indices with the checked `Usize` addition.  Both are `RustM` actions
+that cannot fail here (the indices are in range, the sums are tiny), and both
+are needed as equations for the same reason `loop_range_eq` is. -/
+
+theorem index_usize_eq {α : Type} [Inhabited α] {n : Std.Usize}
+    (v : Std.Array α n) (i : Std.Usize) (h : i.val < n.val) :
+    v.index_usize i = ok v.val[i.val]! := by
+  have hlen : v.val.length = n.val := v.property
+  unfold Std.Array.index_usize
+  rw [Std.Array.getElem?_Usize_eq, List.getElem?_eq_getElem (by omega),
+    getElem!_pos v.val i.val (by omega)]
+
+theorem usize_add_eq (x y : Std.Usize) (h : x.val + y.val ≤ Std.Usize.max) :
+    ∃ z : Std.Usize, x + y = ok z ∧ z.val = x.val + y.val := by
+  have he := Std.UScalar.add_equiv x y
+  cases hxy : (x + y : RustM Std.Usize) with
+  | ok z => rw [hxy] at he; exact ⟨z, rfl, he.2.1⟩
+  | fail e =>
+    rw [hxy] at he
+    exact absurd he.2 (by simp only [Std.UScalar.inBounds, not_not]; scalar_tac)
+  | div => rw [hxy] at he; exact he.elim
+
+theorem slice_index_usize_eq {α : Type} [Inhabited α] (v : Slice α) (i : Std.Usize)
+    (h : i.val < v.val.length) : Std.Slice.index_usize v i = ok v.val[i.val]! := by
+  unfold Std.Slice.index_usize
+  rw [show v[i]? = v.val[i.val]? from rfl, List.getElem?_eq_getElem h,
+    getElem!_pos v.val i.val h]
+
+theorem usize_sub_eq (x y : Std.Usize) (h : y.val ≤ x.val) :
+    ∃ z : Std.Usize, x - y = ok z ∧ z.val = x.val - y.val := by
+  have he := Std.UScalar.sub_equiv x y
+  cases hxy : (x - y : RustM Std.Usize) with
+  | ok z => rw [hxy] at he; exact ⟨z, rfl, by omega⟩
+  | fail e => rw [hxy] at he; exact absurd he.2 (by omega)
+  | div => rw [hxy] at he; exact he.elim
+
+theorem usize_rem_eq (x y : Std.Usize) (h : y.val ≠ 0) :
+    ∃ z : Std.Usize, x % y = ok z ∧ z.val = x.val % y.val := by
+  have hs := Std.Usize.rem_spec (x := x) (y := y)
+  unfold WP.partialSpec at hs
+  cases hxy : (x % y : RustM Std.Usize) with
+  | ok z => rw [hxy] at hs; exact ⟨z, rfl, hs⟩
+  | fail e => rw [hxy] at hs; cases e <;> simp_all
+  | div => rw [hxy] at hs; exact hs.elim
+
+theorem array_update_eq {α : Type} {n : Std.Usize}
+    (v : Std.Array α n) (i : Std.Usize) (x : α) (h : i.val < n.val) :
+    v.update i x = ok (v.set i x) := by
+  have hlen : v.val.length = n.val := v.property
+  unfold Std.Array.update
+  rw [Std.Array.getElem?_Usize_eq, List.getElem?_eq_getElem (by omega)]
+  rfl
+
+theorem usize_mul_eq (x y : Std.Usize) (h : x.val * y.val ≤ Std.Usize.max) :
+    ∃ z : Std.Usize, x * y = ok z ∧ z.val = x.val * y.val := by
+  have he := Std.UScalar.mul_equiv x y
+  have hdef : (x * y : RustM Std.Usize) = Std.UScalar.mul x y := rfl
+  rw [hdef]
+  cases hm : Std.UScalar.mul x y with
+  | ok z => rw [hm] at he; exact ⟨z, rfl, he.2.1⟩
+  | fail e => rw [hm] at he; exact absurd he.2 (by scalar_tac)
+  | div => rw [hm] at he; exact he.elim
+
+theorem i64_mul_eq (x y : Std.I64)
+    (h0 : Std.IScalar.min .I64 ≤ x.val * y.val) (h1 : x.val * y.val ≤ Std.IScalar.max .I64) :
+    ∃ z : Std.I64, x * y = ok z ∧ z.val = x.val * y.val := by
+  have he := Std.IScalar.mul_equiv x y
+  have hdef : (x * y : RustM Std.I64) = Std.IScalar.mul x y := rfl
+  rw [hdef]
+  cases hm : Std.IScalar.mul x y with
+  | ok z => rw [hm] at he; exact ⟨z, rfl, he.2.2.1⟩
+  | fail e => rw [hm] at he; exact absurd he.2 (by simp only [not_and, not_le]; omega)
+  | div => rw [hm] at he; exact he.elim
+
+theorem i64_div_eq (x y : Std.I64) (hy : y.val ≠ 0) (hmin : x.val ≠ Std.I64.min) :
+    ∃ z : Std.I64, x / y = ok z ∧ z.val = Int.tdiv x.val y.val := by
+  have hs := Std.I64.div_spec (x := x) (y := y)
+  unfold WP.partialSpec at hs
+  cases hxy : (x / y : RustM Std.I64) with
+  | ok z => rw [hxy] at hs; exact ⟨z, rfl, hs⟩
+  | fail e => rw [hxy] at hs; cases e <;> simp_all
+  | div => rw [hxy] at hs; exact hs.elim
+
+theorem usize_shl_eq (x y : Std.Usize) (h : y.val < Std.UScalarTy.Usize.numBits) :
+    ∃ z : Std.Usize, x <<< y = ok z ∧ z.val = (x.val <<< y.val) % Std.Usize.size := by
+  have hs := Std.Usize.ShiftLeft_spec x y
+  unfold WP.partialSpec at hs
+  cases hxy : (x <<< y : RustM Std.Usize) with
+  | ok z => rw [hxy] at hs; exact ⟨z, rfl, hs.1⟩
+  | fail e => rw [hxy] at hs; cases e <;> (simp_all; try omega)
+  | div => rw [hxy] at hs; exact hs.elim
+
+/-- `Vec::push`, as an equation: it can only fail on a vector longer than the
+    address space, which nothing here is. -/
+theorem vec_push_eq {α : Type} (v : alloc.vec.Vec α) (x : α)
+    (h : v.val.length < Std.Usize.max) :
+    alloc.vec.Vec.push v x = ok ⟨v.val ++ [x], by simp; scalar_tac⟩ := by
+  unfold alloc.vec.Vec.push rust_primitives.sequence.seq_push
+  rw [dif_pos (by simp; scalar_tac)]
+  rfl
+
+/-! ## The signed side: `imod`
+
+`theta`'s D loop indexes with `x - 1` and `z - 1`, which FIPS 202 reads modulo 5
+and modulo `w`.  Rust's `%` truncates towards zero, so the spec spells the
+mathematical modulus out as `imod a b = ((a % b) + b) % b` over `i64`, casting
+the result back to an index.  `imod_eq` says that is the mathematical modulus
+whenever `|a| < b`, which is all the spec ever uses it at. -/
+
+theorem usize_to_i64 (x : Std.Usize) (h : (x.val : Int) ≤ Std.IScalar.max .I64) :
+    ∃ i : Std.I64, lift (Std.UScalar.hcast .I64 x) = ok i ∧ i.val = (x.val : Int) :=
+  WP.spec_imp_exists (Std.UScalar.hcast_inBounds_spec .I64 x h)
+
+theorem i64_to_usize_val (i : Std.I64)
+    (h0 : 0 ≤ i.val) (h1 : i.val ≤ Std.UScalar.max .Usize) :
+    ((Std.IScalar.hcast Std.UScalarTy.Usize i).val : Int) = i.val := by
+  obtain ⟨y, hy, hyv⟩ := WP.spec_imp_exists (Std.IScalar.hcast_inBounds_spec .Usize i ⟨h0, h1⟩)
+  have hlift : lift (Std.IScalar.hcast Std.UScalarTy.Usize i)
+      = ok (Std.IScalar.hcast Std.UScalarTy.Usize i) := rfl
+  rw [hlift] at hy
+  cases hy
+  exact hyv
+
+theorem i64_add_eq (x y : Std.I64)
+    (h0 : Std.IScalar.min .I64 ≤ x.val + y.val) (h1 : x.val + y.val ≤ Std.IScalar.max .I64) :
+    ∃ z : Std.I64, x + y = ok z ∧ z.val = x.val + y.val := by
+  have he := Std.IScalar.add_equiv x y
+  cases hxy : (x + y : RustM Std.I64) with
+  | ok z => rw [hxy] at he; exact ⟨z, rfl, he.2.1⟩
+  | fail e => rw [hxy] at he; exact absurd he.2 (by simp only [Std.IScalar.inBounds, not_not]; constructor <;> scalar_tac)
+  | div => rw [hxy] at he; exact he.elim
+
+theorem i64_sub_eq (x y : Std.I64)
+    (h0 : Std.IScalar.min .I64 ≤ x.val - y.val) (h1 : x.val - y.val ≤ Std.IScalar.max .I64) :
+    ∃ z : Std.I64, x - y = ok z ∧ z.val = x.val - y.val := by
+  have he := Std.IScalar.sub_equiv x y
+  cases hxy : (x - y : RustM Std.I64) with
+  | ok z => rw [hxy] at he; exact ⟨z, rfl, he.2.1⟩
+  | fail e => rw [hxy] at he; exact absurd he.2 (by simp only [Std.IScalar.inBounds, not_not]; constructor <;> scalar_tac)
+  | div => rw [hxy] at he; exact he.elim
+
+theorem i64_rem_eq (x y : Std.I64) (hy : y.val ≠ 0) (hmin : x.val ≠ Std.I64.min) :
+    ∃ z : Std.I64, x % y = ok z ∧ z.val = Int.tmod x.val y.val := by
+  have hs := Std.I64.rem_spec (x := x) (y := y)
+  unfold WP.partialSpec at hs
+  cases hxy : (x % y : RustM Std.I64) with
+  | ok z => rw [hxy] at hs; exact ⟨z, rfl, hs⟩
+  | fail e => rw [hxy] at hs; cases e <;> simp_all
+  | div => rw [hxy] at hs; exact hs.elim
+
+set_option maxRecDepth 8000 in
+/-- The truncating-remainder dance `((a % b) + b) % b` is the mathematical
+    modulus, `Int.emod`, for every positive `b` that leaves the intermediate in
+    range.  Both `imod` and `pad10*1` compute it. -/
+theorem i64_emod_chain (a b : Std.I64) (hb : 0 < b.val)
+    (hamin : a.val ≠ Std.I64.min) (hmax : 2 * b.val ≤ Std.IScalar.max .I64) :
+    ∃ i i1 z : Std.I64,
+      a % b = ok i ∧ i + b = ok i1 ∧ i1 % b = ok z ∧ z.val = a.val % b.val := by
+  have hminI : Std.IScalar.min Std.IScalarTy.I64 = -9223372036854775808 := by
+    rw [Std.IScalar.min_IScalarTy_I64_eq, Std.I64.min_eq]
+  have hmaxI : Std.IScalar.max Std.IScalarTy.I64 = 9223372036854775807 := by
+    rw [Std.IScalar.max_IScalarTy_I64_eq, Std.I64.max_eq]
+  have hminN : Std.I64.min = -9223372036854775808 := Std.I64.min_eq
+  have hpow : (2:Int) ^ (Std.IScalarTy.I64.numBits - 1) = 9223372036854775808 := by
+    norm_num [Std.IScalarTy.numBits]
+  have hab := a.hBounds
+  have hbb := b.hBounds
+  rw [hpow] at hab hbb
+  have hem0 : 0 ≤ a.val % b.val := Int.emod_nonneg _ (by omega)
+  have hem1 : a.val % b.val < b.val := Int.emod_lt_of_pos _ hb
+  obtain ⟨i, hi, hiv⟩ := i64_rem_eq a b (by omega) hamin
+  have hib : i.val = a.val % b.val ∨ i.val = a.val % b.val - b.val := by
+    rw [hiv, Int.tmod_eq_emod]
+    by_cases hc : 0 ≤ a.val ∨ b.val ∣ a.val
+    · rw [if_pos hc]; left; ring
+    · rw [if_neg hc]
+      right
+      have : (b.val.natAbs : Int) = b.val := by omega
+      rw [this]
+  have hirange : -b.val ≤ i.val ∧ i.val < b.val := by omega
+  have hi_lb : 0 ≤ i.val + b.val := by omega
+  have hi_ub : i.val + b.val < 2 * b.val := by omega
+  obtain ⟨i1, hi1, hi1v⟩ := i64_add_eq i b (by omega) (by omega)
+  obtain ⟨i2, hi2, hi2v⟩ := i64_rem_eq i1 b (by omega) (by omega)
+  have hi2a : i2.val = a.val % b.val := by
+    have hi1nn : 0 ≤ i1.val := by omega
+    rw [hi2v, Int.tmod_eq_emod, if_pos (Or.inl hi1nn), hi1v]
+    have hsub : (i.val + b.val) % b.val = i.val % b.val := by simp
+    rw [hsub]
+    rcases hib with h | h
+    · rw [h]
+      simp
+    · rw [h]
+      have hstep : (a.val % b.val - b.val) % b.val = (a.val % b.val) % b.val := by
+        simp
+      rw [hstep]
+      simp
+  exact ⟨i, i1, i2, hi, hi1, hi2, hi2a⟩
+
+/-- With `|a| < b` or not, `imod` is `Int.emod`; it is `i64_emod_chain` plus the
+    cast back to an index. -/
+theorem imod_eq (a b : Std.I64) (hb : 0 < b.val)
+    (hamin : a.val ≠ Std.I64.min) (hmax : 2 * b.val ≤ Std.IScalar.max .I64)
+    (hbu : b.val ≤ Std.UScalar.max Std.UScalarTy.Usize) :
+    ∃ m : Std.Usize, pedantic_sha3.step_mappings.imod a b = ok m
+      ∧ (m.val : Int) = a.val % b.val := by
+  obtain ⟨i, i1, z, hi, hi1, hz, hzv⟩ := i64_emod_chain a b hb hamin hmax
+  have hem0 : 0 ≤ a.val % b.val := Int.emod_nonneg _ (by omega)
+  have hem1 : a.val % b.val < b.val := Int.emod_lt_of_pos _ hb
+  refine ⟨Std.IScalar.hcast Std.UScalarTy.Usize z, ?_, ?_⟩
+  · unfold pedantic_sha3.step_mappings.imod
+    rw [hi, bind_tc_ok, hi1, bind_tc_ok, hz, bind_tc_ok]
+  · rw [i64_to_usize_val z (by omega) (by omega), hzv]
+
+/-! ## `Iterator::next` on a `Range I64`
+
+ρ walks `for t in 0..24` over `i64`, and the round loop of `keccak_p` does the
+same, so the signed iterator needs the two equations too.  hax ships the triple
+for `I32` and `Usize` only; this is the `I64` twin of its `I32` proof, from
+which the equations follow as above. -/
+
+private theorem hcast_cast_one_val_i64 :
+    (Std.UScalar.hcast Std.IScalarTy.I64
+      (Std.UScalar.cast Std.UScalarTy.U64 (1#usize))).val = 1 := by
+  simp only [Std.UScalar.hcast, Std.IScalar.val, BitVec.toInt_setWidth]; grind
+
+private theorem i64_wrapping_add_one_val (i : Std.I64)
+    (h1 : -9223372036854775808 ≤ i.val) (h2 : i.val ≤ 9223372036854775806) :
+    (i.wrapping_add (Std.UScalar.hcast Std.IScalarTy.I64
+        (Std.UScalar.cast Std.UScalarTy.U64 1#usize))).val = i.val + 1 := by
+  simp only [Std.I64.wrapping_add_val_eq, hcast_cast_one_val_i64, Nat.reducePow]
+  grind
+
+theorem IteratorRange_next_spec_i64 (i e : Std.I64) {Q}
+    (h_lt : (h : i.val < e.val) →
+      ∀ (s : Std.I64), s.val = i.val + 1 →
+        (Q.1 (some i, { start := s, «end» := e })).down)
+    (h_ge : i.val ≥ e.val →
+      (Q.1 (none, { start := i, «end» := e })).down) :
+    ⦃ ⌜ True ⌝ ⦄
+    core.IteratorRange.next core.I64.Insts.CoreIterRangeStep
+      { start := i, «end» := e }
+    ⦃ Q ⦄ := by
+  unfold core.IteratorRange.next core.I64.Insts.CoreIterRangeStep
+  by_cases h : i.val < e.val
+  · have h_lt' := h_lt h
+    simp_all [compare, compareOfLessAndEq,
+      core.I64.Insts.CoreCmpPartialOrdI64, core.mkIPartialOrd,
+      core.I64.Insts.CoreCloneClone.clone,
+      core.I64.Insts.CoreIterRangeStep.forward_checked,
+      core.U64.Insts.CoreConvertTryFromUsizeTryFromIntError.try_from,
+      core.num.U64.MAX, core.num.U64.MIN,
+      core.num.I64.wrapping_add, rust_primitives.arithmetic.wrapping_add_i64]
+    mvcgen
+    all_goals first
+      | refine h_lt' _ ?_
+        subst_vars
+        exact i64_wrapping_add_one_val i (by scalar_tac) (by scalar_tac)
+      | simp_all only [Std.U64.rMax, hcast_cast_one_val_i64,
+          Std.UScalar.cast_val_eq, Std.UScalar.ofNatCore_val_eq]
+        first
+          | scalar_tac
+          | (rcases System.Platform.numBits_eq with hN | hN <;> simp [hN] at * <;> omega)
+          | grind
+  · have h_ge' := h_ge (by omega)
+    simp only [compare, compareOfLessAndEq,
+      core.I64.Insts.CoreCmpPartialOrdI64, core.mkIPartialOrd]
+    mvcgen
+    have hlt : ¬ (i.val < e.val) := by omega
+    by_cases hie : i.val = e.val <;> simp_all
+
+theorem range_next_lt_i64 (i e : Std.I64) (h : i.val < e.val) :
+    ∃ s : Std.I64, s.val = i.val + 1 ∧
+      core.ops.range.Range.Insts.CoreIterTraitsIteratorIterator.next
+        core.I64.Insts.CoreIterRangeStep { start := i, «end» := e }
+        = ok (some i, { start := s, «end» := e }) := by
+  have ht := IteratorRange_next_spec_i64 (Q := PostCond.noThrow fun p =>
+      ⌜ ∃ s : Std.I64, s.val = i.val + 1 ∧ p = (some i, { start := s, «end» := e }) ⌝)
+    i e (fun _ s hs => ⟨s, hs, rfl⟩) (fun hge => absurd h (by omega))
+  obtain ⟨v, hv⟩ := Hax.triple_noThrow_exists_ok ht
+  obtain ⟨s, hs, hveq⟩ := Hax.triple_noThrow_elim ht hv
+  refine ⟨s, hs, ?_⟩
+  show core.IteratorRange.next _ _ = _
+  rw [hv, hveq]
+
+theorem range_next_ge_i64 (i e : Std.I64) (h : e.val ≤ i.val) :
+    core.ops.range.Range.Insts.CoreIterTraitsIteratorIterator.next
+      core.I64.Insts.CoreIterRangeStep { start := i, «end» := e }
+      = ok (none, { start := i, «end» := e }) := by
+  have ht := IteratorRange_next_spec_i64 (Q := PostCond.noThrow fun p =>
+      ⌜ p = (none, { start := i, «end» := e }) ⌝)
+    i e (fun hlt _ _ => absurd hlt (by omega)) (fun _ => rfl)
+  obtain ⟨v, hv⟩ := Hax.triple_noThrow_exists_ok ht
+  have hveq := Hax.triple_noThrow_elim ht hv
+  show core.IteratorRange.next _ _ = _
+  rw [hv, hveq]
+
+/-- The `I64` instance of `loop_range_eq_inv`, for ρ's walk. -/
+theorem loop_range_eq_inv_i64 {β γ : Type}
+    (body : (core.ops.range.Range Std.I64 × β) →
+      RustM (ControlFlow (core.ops.range.Range Std.I64 × β) γ))
+    (e : Std.I64) (Inv : Std.I64 → β → Prop) (P : Std.I64 → β → γ → Prop)
+    (hstep : ∀ (i : Std.I64) (acc : β), i.val < e.val → Inv i acc →
+      ∃ (s : Std.I64) (acc' : β), s.val = i.val + 1 ∧ Inv s acc' ∧
+        body ({ start := i, «end» := e }, acc)
+          = ok (.cont ({ start := s, «end» := e }, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (acc : β), Inv e acc →
+      ∃ r, body ({ start := e, «end» := e }, acc) = ok (.done r) ∧ P e acc r) :
+    ∀ (k : Nat) (i : Std.I64) (acc : β), i.val + k = e.val → Inv i acc →
+      ∃ r, loop body ({ start := i, «end» := e }, acc) = ok r ∧ P i acc r :=
+  loop_range_eq_inv (fun x : Std.I64 => x.val)
+    (fun i j h => (Std.IScalar.eq_equiv i j).mpr h) body e Inv P hstep hdone
+
+/-! ## `Iterator::next` on a `RangeInclusive`
+
+`core-models` ships no `Iterator` instance for `RangeInclusive`, so the spec
+package supplies one itself (`Assumptions/FunsExternal.lean`), following the
+Rust standard library: it yields `start` and steps it forward while
+`start < end`, and yields `end` once more, setting `exhausted`, when the two
+meet. ι iterates `0..=l`, the round-constant LFSR iterates `1..=t`, and
+`Keccak-p`'s round loop iterates its round indices, so the bridge needs its
+equations at `Usize` and at `I64`.
+
+The loop inductions below index the iteration by the next element `i` to be
+yielded, from `start` up to `end + 1`. `inclState val i e` is the range in that
+position: not exhausted and starting at `i` while `i ≤ e`, and exhausted once
+`i` is past `e`. -/
+
+/-- The range `..= e` about to yield `i`, or exhausted once `i` is past `e`. -/
+def inclState {ι : Type} (val : ι → Int) (i e : ι) : core.ops.range.RangeInclusive ι :=
+  if val e < val i then { start := e, «end» := e, exhausted := true }
+  else { start := i, «end» := e, exhausted := false }
+
+theorem inclState_le {ι : Type} (val : ι → Int) (i e : ι) (h : val i ≤ val e) :
+    inclState val i e = { start := i, «end» := e, exhausted := false } := by
+  unfold inclState; rw [if_neg (by omega)]
+
+theorem inclState_gt {ι : Type} (val : ι → Int) (i e : ι) (h : val e < val i) :
+    inclState val i e = { start := e, «end» := e, exhausted := true } := by
+  unfold inclState; rw [if_pos h]
+
+/-- The index function of the `Usize` instance. -/
+abbrev uval (x : Std.Usize) : Int := x.val
+
+/-- The index function of the `I64` instance. -/
+abbrev ival (x : Std.I64) : Int := x.val
+
+theorem range_incl_next_lt (i e : Std.Usize) (h : i.val < e.val) :
+    ∃ s : Std.Usize, s.val = i.val + 1 ∧
+      core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+        core.Usize.Insts.CoreIterRangeStep { start := i, «end» := e, exhausted := false }
+        = ok (some i, { start := s, «end» := e, exhausted := false }) := by
+  have h1 : (1#usize : Std.Usize).val = 1 := rfl
+  have hov := Std.UScalar.overflowing_add_eq i (1#usize)
+  dsimp only at hov
+  rw [if_neg (by rw [h1]; scalar_tac)] at hov
+  obtain ⟨hv, hf⟩ := hov
+  refine ⟨(Std.UScalar.overflowing_add i 1#usize).1, by rw [hv, h1], ?_⟩
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.Usize.Insts.CoreIterRangeStep
+  have hcmp : compare i.val e.val = Ordering.lt := by rw [Nat.compare_eq_lt]; exact h
+  simp [core.Usize.Insts.CoreCmpPartialOrdUsize, core.mkUPartialOrd, hcmp,
+    core.Usize.Insts.CoreCloneClone.clone,
+    core.Usize.Insts.CoreIterRangeStep.forward_checked,
+    core.convert.TryFromUTInfallible.Blanket.try_from,
+    core.convert.From.Blanket.from,
+    core.num.Usize.checked_add, core.num.Usize.overflowing_add,
+    rust_primitives.arithmetic.overflowing_add_usize]
+  generalize Std.UScalar.overflowing_add i 1#usize = p at hf ⊢
+  obtain ⟨r, o⟩ := p
+  simp only at hf
+  subst hf
+  simp
+
+theorem range_incl_next_eq (e : Std.Usize) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.Usize.Insts.CoreIterRangeStep { start := e, «end» := e, exhausted := false }
+      = ok (some e, { start := e, «end» := e, exhausted := true }) := by
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.Usize.Insts.CoreIterRangeStep
+  simp [core.Usize.Insts.CoreCmpPartialOrdUsize, core.mkUPartialOrd,
+    core.Usize.Insts.CoreCloneClone.clone]
+
+theorem range_incl_next_exhausted (i e : Std.Usize) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.Usize.Insts.CoreIterRangeStep { start := i, «end» := e, exhausted := true }
+      = ok (none, { start := i, «end» := e, exhausted := true }) := by
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.Usize.Insts.CoreIterRangeStep
+  simp [core.Usize.Insts.CoreCmpPartialOrdUsize, core.mkUPartialOrd]
+
+/-- A step of the iteration. `hsafe` provides the index `i + 1` that names the
+    position after `i`; when `i` is `e` that position is the exhausted range,
+    reached without stepping past `e`. -/
+theorem range_incl_next_le (i e : Std.Usize) (h : i.val ≤ e.val)
+    (hsafe : i.val + 1 ≤ Std.UScalar.max Std.UScalarTy.Usize) :
+    ∃ s : Std.Usize, s.val = i.val + 1 ∧
+      core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+        core.Usize.Insts.CoreIterRangeStep (inclState uval i e)
+        = ok (some i, inclState uval s e) := by
+  rw [inclState_le uval i e (by simp [uval]; omega)]
+  rcases Nat.lt_or_eq_of_le h with hlt | heq
+  · obtain ⟨s, hs, hn⟩ := range_incl_next_lt i e hlt
+    exact ⟨s, hs, by rw [hn, inclState_le uval s e (by simp [uval]; omega)]⟩
+  · have hie : i = e := Std.UScalar.eq_of_val_eq heq
+    subst hie
+    refine ⟨Std.UScalar.ofNatCore (i.val + 1) (by scalar_tac), by simp, ?_⟩
+    rw [range_incl_next_eq, inclState_gt uval _ i (by simp [uval])]
+
+/-- Past the end, the range is exhausted and yields nothing. -/
+theorem range_incl_next_gt (i e : Std.Usize) (h : e.val < i.val) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.Usize.Insts.CoreIterRangeStep (inclState uval i e)
+      = ok (none, inclState uval i e) := by
+  rw [inclState_gt uval i e (by simp [uval]; omega)]
+  exact range_incl_next_exhausted e e
+
+/-- The loop induction for an inclusive range, over any index type and with an
+    invariant on the accumulator: one more iteration than the half-open one, and
+    the exit is the exhausted range. -/
+theorem loop_range_incl_eq_inv_gen {ι β γ : Type} (val : ι → Int)
+    (body : (core.ops.range.RangeInclusive ι × β) →
+      RustM (ControlFlow (core.ops.range.RangeInclusive ι × β) γ))
+    (e : ι) (Inv : ι → β → Prop) (P : ι → β → γ → Prop)
+    (hstep : ∀ (i : ι) (acc : β), val i ≤ val e → Inv i acc →
+      ∃ (s : ι) (acc' : β), val s = val i + 1 ∧ Inv s acc' ∧
+        body (inclState val i e, acc) = ok (.cont (inclState val s e, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (i : ι) (acc : β), val e < val i → Inv i acc →
+      ∃ r, body (inclState val i e, acc) = ok (.done r) ∧ P i acc r) :
+    ∀ (k : Nat) (i : ι) (acc : β), val i + k = val e + 1 → Inv i acc →
+      ∃ r, loop body (inclState val i e, acc) = ok r ∧ P i acc r := by
+  intro k
+  induction k with
+  | zero =>
+    intro i acc hik hinv
+    obtain ⟨r, hb, hP⟩ := hdone i acc (by omega) hinv
+    exact ⟨r, by rw [loop.eq_def, hb], hP⟩
+  | succ k ih =>
+    intro i acc hik hinv
+    obtain ⟨s, acc', hs, hinv', hb, hP⟩ := hstep i acc (by omega) hinv
+    obtain ⟨r, hr, hPr⟩ := ih s acc' (by omega) hinv'
+    exact ⟨r, by rw [loop.eq_def, hb]; exact hr, hP r hPr⟩
+
+/-- The invariant-free version. -/
+theorem loop_range_incl_eq_gen {ι β γ : Type} (val : ι → Int)
+    (body : (core.ops.range.RangeInclusive ι × β) →
+      RustM (ControlFlow (core.ops.range.RangeInclusive ι × β) γ))
+    (e : ι) (P : ι → β → γ → Prop)
+    (hstep : ∀ (i : ι) (acc : β), val i ≤ val e →
+      ∃ (s : ι) (acc' : β), val s = val i + 1 ∧
+        body (inclState val i e, acc) = ok (.cont (inclState val s e, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (i : ι) (acc : β), val e < val i →
+      ∃ r, body (inclState val i e, acc) = ok (.done r) ∧ P i acc r) :
+    ∀ (k : Nat) (i : ι) (acc : β), val i + k = val e + 1 →
+      ∃ r, loop body (inclState val i e, acc) = ok r ∧ P i acc r := by
+  intro k i acc hik
+  refine loop_range_incl_eq_inv_gen val body e (fun _ _ => True) P ?_ ?_ k i acc hik trivial
+  · intro j acc' hj _
+    obtain ⟨s, acc'', hs, hb, hP⟩ := hstep j acc' hj
+    exact ⟨s, acc'', hs, trivial, hb, hP⟩
+  · intro j acc' hj _
+    exact hdone j acc' hj
+
+/-- The `Usize` instance, used by ι and the round-constant LFSR. -/
+theorem loop_range_incl_eq {β γ : Type}
+    (body : (core.ops.range.RangeInclusive Std.Usize × β) →
+      RustM (ControlFlow (core.ops.range.RangeInclusive Std.Usize × β) γ))
+    (e : Std.Usize) (P : Std.Usize → β → γ → Prop)
+    (hstep : ∀ (i : Std.Usize) (acc : β), i.val ≤ e.val →
+      ∃ (s : Std.Usize) (acc' : β), s.val = i.val + 1 ∧
+        body (inclState uval i e, acc) = ok (.cont (inclState uval s e, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (i : Std.Usize) (acc : β), e.val < i.val →
+      ∃ r, body (inclState uval i e, acc) = ok (.done r) ∧ P i acc r) :
+    ∀ (k : Nat) (i : Std.Usize) (acc : β), i.val + k = e.val + 1 →
+      ∃ r, loop body (inclState uval i e, acc) = ok r ∧ P i acc r := by
+  intro k i acc hik
+  refine loop_range_incl_eq_gen uval body e P ?_ ?_ k i acc (by simp [uval]; omega)
+  · intro j acc' hj
+    obtain ⟨s, acc'', hs, hb, hP⟩ := hstep j acc' (by simp [uval] at hj; omega)
+    exact ⟨s, acc'', by simp [uval]; omega, hb, hP⟩
+  · intro j acc' hj
+    exact hdone j acc' (by simp [uval] at hj; omega)
+
+/-! ### At `I64`
+
+`Keccak-p`'s round loop runs `for i_r in (12 + 2l - n_r)..=(12 + 2l - 1)`. -/
+
+theorem RangeInclusive_next_spec_lt_i64 (i e : Std.I64) {Q} (h : i.val < e.val)
+    (h_lt : ∀ (s : Std.I64), s.val = i.val + 1 →
+      (Q.1 (some i, { start := s, «end» := e, exhausted := false })).down) :
+    ⦃ ⌜ True ⌝ ⦄
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.I64.Insts.CoreIterRangeStep { start := i, «end» := e, exhausted := false }
+    ⦃ Q ⦄ := by
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.I64.Insts.CoreIterRangeStep
+  have h_lt' := h_lt
+  simp_all [compare, compareOfLessAndEq,
+    core.I64.Insts.CoreCmpPartialOrdI64, core.mkIPartialOrd,
+    core.I64.Insts.CoreCloneClone.clone,
+    core.I64.Insts.CoreIterRangeStep.forward_checked,
+    core.U64.Insts.CoreConvertTryFromUsizeTryFromIntError.try_from,
+    core.num.U64.MAX, core.num.U64.MIN,
+    core.num.I64.wrapping_add, rust_primitives.arithmetic.wrapping_add_i64]
+  mvcgen
+  all_goals first
+    | refine h_lt' _ ?_
+      subst_vars
+      exact i64_wrapping_add_one_val i (by scalar_tac) (by scalar_tac)
+    | simp_all only [Std.U64.rMax, hcast_cast_one_val_i64,
+        Std.UScalar.cast_val_eq, Std.UScalar.ofNatCore_val_eq]
+      first
+        | scalar_tac
+        | (rcases System.Platform.numBits_eq with hN | hN <;> simp [hN] at * <;> omega)
+        | grind
+
+theorem range_incl_next_lt_i64 (i e : Std.I64) (h : i.val < e.val) :
+    ∃ s : Std.I64, s.val = i.val + 1 ∧
+      core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+        core.I64.Insts.CoreIterRangeStep { start := i, «end» := e, exhausted := false }
+        = ok (some i, { start := s, «end» := e, exhausted := false }) := by
+  have ht := RangeInclusive_next_spec_lt_i64 (Q := PostCond.noThrow fun p =>
+      ⌜ ∃ s : Std.I64, s.val = i.val + 1 ∧
+        p = (some i, { start := s, «end» := e, exhausted := false }) ⌝)
+    i e h (fun s hs => ⟨s, hs, rfl⟩)
+  obtain ⟨v, hv⟩ := Hax.triple_noThrow_exists_ok ht
+  obtain ⟨s, hs, hveq⟩ := Hax.triple_noThrow_elim ht hv
+  exact ⟨s, hs, by rw [hv, hveq]⟩
+
+theorem range_incl_next_eq_i64 (e : Std.I64) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.I64.Insts.CoreIterRangeStep { start := e, «end» := e, exhausted := false }
+      = ok (some e, { start := e, «end» := e, exhausted := true }) := by
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.I64.Insts.CoreIterRangeStep
+  simp [compare, compareOfLessAndEq, core.I64.Insts.CoreCmpPartialOrdI64,
+    core.mkIPartialOrd, core.I64.Insts.CoreCloneClone.clone]
+
+theorem range_incl_next_exhausted_i64 (i e : Std.I64) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.I64.Insts.CoreIterRangeStep { start := i, «end» := e, exhausted := true }
+      = ok (none, { start := i, «end» := e, exhausted := true }) := by
+  unfold core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+    core.I64.Insts.CoreIterRangeStep
+  simp [core.I64.Insts.CoreCmpPartialOrdI64, core.mkIPartialOrd]
+
+theorem range_incl_next_le_i64 (i e : Std.I64) (h : i.val ≤ e.val)
+    (hsafe : i.val + 1 ≤ Std.IScalar.max Std.IScalarTy.I64) :
+    ∃ s : Std.I64, s.val = i.val + 1 ∧
+      core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+        core.I64.Insts.CoreIterRangeStep (inclState ival i e)
+        = ok (some i, inclState ival s e) := by
+  rw [inclState_le ival i e h]
+  rcases lt_or_eq_of_le h with hlt | heq
+  · obtain ⟨s, hs, hn⟩ := range_incl_next_lt_i64 i e hlt
+    exact ⟨s, hs, by rw [hn, inclState_le ival s e (by simp [ival]; omega)]⟩
+  · have hie : i = e := Std.IScalar.eq_of_val_eq heq
+    subst hie
+    refine ⟨Std.IScalar.ofIntCore (i.val + 1) (by scalar_tac), by simp, ?_⟩
+    rw [range_incl_next_eq_i64, inclState_gt ival _ i (by simp [ival])]
+
+theorem range_incl_next_gt_i64 (i e : Std.I64) (h : e.val < i.val) :
+    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next
+      core.I64.Insts.CoreIterRangeStep (inclState ival i e)
+      = ok (none, inclState ival i e) := by
+  rw [inclState_gt ival i e h]
+  exact range_incl_next_exhausted_i64 e e
+
+/-- The `I64` instance with an invariant, used by `Keccak-p`'s round loop. -/
+theorem loop_range_incl_eq_inv_i64 {β γ : Type}
+    (body : (core.ops.range.RangeInclusive Std.I64 × β) →
+      RustM (ControlFlow (core.ops.range.RangeInclusive Std.I64 × β) γ))
+    (e : Std.I64) (Inv : Std.I64 → β → Prop) (P : Std.I64 → β → γ → Prop)
+    (hstep : ∀ (i : Std.I64) (acc : β), i.val ≤ e.val → Inv i acc →
+      ∃ (s : Std.I64) (acc' : β), s.val = i.val + 1 ∧ Inv s acc' ∧
+        body (inclState ival i e, acc) = ok (.cont (inclState ival s e, acc')) ∧
+        ∀ r, P s acc' r → P i acc r)
+    (hdone : ∀ (i : Std.I64) (acc : β), e.val < i.val → Inv i acc →
+      ∃ r, body (inclState ival i e, acc) = ok (.done r) ∧ P i acc r) :
+    ∀ (k : Nat) (i : Std.I64) (acc : β), i.val + k = e.val + 1 → Inv i acc →
+      ∃ r, loop body (inclState ival i e, acc) = ok r ∧ P i acc r :=
+  loop_range_incl_eq_inv_gen ival body e Inv P hstep hdone
+
+/-! ## Loops that push one element per iteration
+
+`bits::trunc`, `zeros`, `concat` and `xor` are all the same loop: run `i` over
+`0 .. n` and push `g i`.  So is each innermost loop of `h2b` / `b2h`.  This is
+that loop, once. -/
+
+theorem push_loop_eq {α : Type}
+    (body : (core.ops.range.Range Std.Usize × alloc.vec.Vec α) →
+      RustM (ControlFlow (core.ops.range.Range Std.Usize × alloc.vec.Vec α)
+        (alloc.vec.Vec α)))
+    (n : Std.Usize) (g : Nat → α) (out0 : alloc.vec.Vec α)
+    (hstep : ∀ (i : Std.Usize) (acc : alloc.vec.Vec α), i.val < n.val →
+      acc.val = out0.val ++ (List.range i.val).map g →
+      ∃ (s : Std.Usize) (acc' : alloc.vec.Vec α), s.val = i.val + 1 ∧
+        acc'.val = acc.val ++ [g i.val] ∧
+        body ({ start := i, «end» := n }, acc)
+          = ok (.cont ({ start := s, «end» := n }, acc')))
+    (hdone : ∀ acc : alloc.vec.Vec α,
+      body ({ start := n, «end» := n }, acc) = ok (.done acc)) :
+    ∃ out : alloc.vec.Vec α,
+      loop body ({ start := 0#usize, «end» := n }, out0) = ok out ∧
+      out.val = out0.val ++ (List.range n.val).map g := by
+  refine loop_range_eq_inv_usize body n
+    (fun i acc => acc.val = out0.val ++ (List.range i.val).map g)
+    (fun _ _ r => r.val = out0.val ++ (List.range n.val).map g)
+    ?hstep ?hdone n 0#usize out0 (by simp) (by simp)
+  case hstep =>
+    intro i acc hi hinv
+    obtain ⟨s, acc', hs, hacc', hbody⟩ := hstep i acc hi hinv
+    refine ⟨s, acc', hs, ?_, hbody, fun r hr => hr⟩
+    rw [hacc', hinv, hs, List.range_succ]
+    simp
+  case hdone =>
+    intro acc hinv
+    exact ⟨acc, hdone acc, hinv⟩
+
+/-! ## `Vec` as a slice
+
+The sponge reads its message a block at a time (`p[i*r .. (i+1)*r]`) and hands
+whole vectors to the permutation, so both the deref and the range index are
+needed as equations. -/
+
+theorem vec_deref_eq {α : Type} (v : alloc.vec.Vec α) :
+    alloc.vec.Vec.Insts.CoreOpsDerefDerefSlice.deref v = ok ⟨v.val, v.property⟩ := rfl
+
+/-! ## `Iterator::next` on a `Range I32`
+
+`h2b` walks the bits of a byte with `for j in 0..8` over `i32`; hax ships the
+triple for that one, so only the equations are needed. -/
+
+/-! ## Copying a slice of `bool`s
+
+The round-constant LFSR shifts its nine bits with `shifted[1..9]
+.copy_from_slice(&r[0..8])`, which bottoms out in a `mapM` of `bool`'s `clone`.
+Cloning a `bool` is the identity, so the copy is just the source. -/
+
+theorem mapM_ok_id {T : Type} (l : List T) : l.mapM (fun x => (ok x : RustM T)) = ok l := by
+  have hloop : ∀ acc : List T,
+      List.mapM.loop (fun x => (ok x : RustM T)) l acc = ok (acc.reverse ++ l) := by
+    intro acc
+    induction l generalizing acc with
+    | nil => simp [List.mapM.loop, pure]
+    | cons a l ih =>
+      simp [List.mapM.loop, bind_tc_ok, ih, List.reverse_cons, List.append_assoc]
+  simp [List.mapM, hloop]
+
+theorem slice_clone_from_slice_bool (dest src : Slice Bool)
+    (h : dest.val.length = src.val.length) :
+    rust_primitives.slice.slice_clone_from_slice core.Bool.Insts.CoreCloneClone dest src
+      = ok src := by
+  have hm : src.val.mapM core.Bool.Insts.CoreCloneClone.clone = ok src.val := mapM_ok_id src.val
+  unfold rust_primitives.slice.slice_clone_from_slice
+  rw [if_pos (by simpa using h)]
+  split
+  · rename_i cloned hc
+    rw [hm] at hc
+    cases hc
+    rfl
+  · rename_i e hc
+    rw [hm] at hc
+    exact absurd hc (by simp)
+  · rename_i hc
+    rw [hm] at hc
+    exact absurd hc (by simp)
+
+/--
+info: 'LibcruxIotSha3.Fips.range_incl_next_eq' depends on axioms: [propext, Classical.choice, Quot.sound]
+-/
+#guard_msgs in
+#print axioms range_incl_next_eq
+
+end LibcruxIotSha3.Fips
