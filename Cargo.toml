@@ -6,13 +6,16 @@
 # that is the point of keeping them in one repository -- so a change to the
 # transcript and the proof update it forces land together. `sha3/spec/mlkem-c-ref`
 # holds tests of the transcript against the SHA-3 code of the ML-KEM C reference
-# implementation; it is a crate of its own so that only it needs a C compiler.
+# implementation, and `sha3/spec/xkcp` against the reference code of the
+# eXtended Keccak Code Package; each is a crate of its own so that only they
+# need a C compiler.
 # `sha3/libcrux-iot-5df472a/tests` runs the implementation against the transcript;
 # it is a crate of its own so that `annotated-upstream/`
 # stays upstream's crate plus the annotation patches.
 members = [
     "sha3/spec",
     "sha3/spec/mlkem-c-ref",
+    "sha3/spec/xkcp",
     "sha3/libcrux-iot-5df472a/annotated-upstream",
     "sha3/libcrux-iot-5df472a/tests",
 ]
