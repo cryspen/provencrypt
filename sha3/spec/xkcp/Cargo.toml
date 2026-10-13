@@ -1,0 +1,15 @@
+[package]
+name = "sha3-xkcp-tests"
+version = "0.1.0"
+edition = "2021"
+description = "Tests of the FIPS 202 transcript against the reference code of the eXtended Keccak Code Package"
+publish = false
+
+[dependencies]
+pedantic-sha3.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1.2.0"

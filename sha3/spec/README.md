@@ -81,6 +81,12 @@ We use the following references to test correctness of our specification:
   through their incremental APIs:
   * the SHA-3 code of the ML-KEM C reference implementation, in the separate
     crate [`mlkem-c-ref`](mlkem-c-ref/README.md);
+  * the reference code of the Keccak team's XKCP, in the separate crate
+    [`xkcp`](xkcp/README.md). It is compared layer by layer: `KECCAK-p[b, n_r]`
+    at `b` = 200, 400, 800 and 1600 and every round count, the sponge at each
+    of those widths, every byte-aligned rate and every suffix of up to seven
+    bits, and the six functions on messages that are not a whole number of
+    bytes and at XOF output lengths that are not either;
   * `libcrux-sha3`, in `compare_ref.rs`, including its `Xof` API and the block
     API ML-KEM samples with.
 
